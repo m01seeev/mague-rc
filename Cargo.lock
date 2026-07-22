@@ -12,18 +12,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ai-overlay-rs"
-version = "0.1.0"
-dependencies = [
- "dotenvy",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "url",
-]
-
-[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -191,6 +179,18 @@ name = "log"
 version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
+
+[[package]]
+name = "mague-rc"
+version = "0.1.0"
+dependencies = [
+ "dotenvy",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
 
 [[package]]
 name = "matchers"

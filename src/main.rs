@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-use ai_overlay_rs::{app, config::Config, error::AppError};
+use mague_rc::{app, config::Config, error::AppError};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]

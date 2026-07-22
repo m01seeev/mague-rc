@@ -9,7 +9,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         audio_source = %config.audio.source,
         stt_model = %config.deepgram.model,
         llm_model = %config.llm.model,
-        "AI Overlay started; press Ctrl+C to stop"
+        "mague-rc started; press Ctrl+C to stop"
     );
 
     tokio::signal::ctrl_c().await.map_err(AppError::Shutdown)?;

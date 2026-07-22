@@ -1,5 +1,5 @@
 [package]
-name = "ai-overlay-rs"
+name = "mague-rc"
 version = "0.1.0"
 edition = "2024"
 

@@ -1,6 +1,8 @@
-# AI Overlay RS
+# mague-rc
 
-Rust scaffold for a local, terminal-first interview assistant. Stages 0 and 1 provide typed environment configuration, validation, structured logging, and graceful Ctrl+C shutdown. Audio capture and provider integrations are intentionally not implemented yet.
+`mague-rc` is a local, terminal-first AI assistant for technical interviews, designed primarily for tiling window managers on Linux. Traditional desktop environments already have comparable assistant and overlay options, while tiling setups need a lightweight tool that integrates cleanly without replacing the window-management workflow.
+
+The initial target is Wayland with Hyprland. Stages 0 and 1 currently provide typed environment configuration, validation, structured logging, and graceful Ctrl+C shutdown. Audio capture, AI providers, and the overlay are intentionally introduced in later stages.
 
 ## Requirements
 
