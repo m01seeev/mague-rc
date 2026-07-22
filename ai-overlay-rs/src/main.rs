@@ -1,0 +1,32 @@
+use std::process::ExitCode;
+
+use ai_overlay_rs::{app, config::Config, error::AppError};
+use tracing_subscriber::EnvFilter;
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), AppError> {
+    init_tracing()?;
+    let config = Config::load()?;
+    app::run(config).await
+}
+
+fn init_tracing() -> Result<(), AppError> {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .compact()
+        .try_init()
+        .map_err(|error| AppError::Tracing(error.to_string()))
+}
