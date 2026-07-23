@@ -4,6 +4,7 @@ use std::{
     ffi::OsStr,
     fmt, fs,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     str::FromStr,
 };
 
@@ -143,7 +144,9 @@ impl Config {
         }
 
         let values = env::vars().collect::<HashMap<_, _>>();
-        Self::from_values(&values)
+        let config = Self::from_values(&values)?;
+        config.validate_ffmpeg_launch()?;
+        Ok(config)
     }
 
     fn from_values(values: &HashMap<String, String>) -> Result<Self, ConfigError> {
@@ -289,6 +292,28 @@ impl Config {
             f32::EPSILON,
         )?;
         positive("OCR_DEBOUNCE_SEC", self.screenshot.debounce_sec)?;
+
+        Ok(())
+    }
+
+    fn validate_ffmpeg_launch(&self) -> Result<(), ConfigError> {
+        let status = Command::new(&self.audio.ffmpeg_bin)
+            .arg("-version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|error| ConfigError::Invalid {
+                name: "FFMPEG_BIN",
+                reason: format!("process could not start: {error}"),
+            })?;
+
+        if !status.success() {
+            return invalid(
+                "FFMPEG_BIN",
+                format!("version probe exited with status {status}"),
+            );
+        }
 
         Ok(())
     }
@@ -599,6 +624,26 @@ mod tests {
         );
 
         let error = Config::from_values(&values).expect_err("missing executable must fail");
+
+        assert!(matches!(
+            error,
+            ConfigError::Invalid {
+                name: "FFMPEG_BIN",
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_ffmpeg_probe_failure() {
+        let mut config =
+            Config::from_values(&valid_values()).expect("base configuration must be valid");
+        config.audio.ffmpeg_bin = PathBuf::from("/bin/false");
+
+        let error = config
+            .validate_ffmpeg_launch()
+            .expect_err("failed version probe must be rejected");
 
         assert!(matches!(
             error,
