@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt;
 use thiserror::Error;
 use tokio::{sync::mpsc, time::sleep};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     config::LlmConfig,
@@ -200,7 +200,7 @@ where
             return Err(LlmError::EmptyResponse);
         }
 
-        info!(
+        debug!(
             module = "llm",
             event = "request_completed",
             request_id = request.request_id,
