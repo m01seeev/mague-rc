@@ -12,7 +12,7 @@ use crate::{
     config::{Config, TranscriptConfig},
     control::TerminalEchoGuard,
     error::AppError,
-    events::DeepgramEvent,
+    events::{DeepgramEvent, TranscriptChunk},
     stt::{DeepgramSttProvider, SpeechToTextProvider, SttError},
     transcript::TranscriptWindowAssembler,
 };
@@ -159,7 +159,7 @@ async fn run_transcript_windows(
         }
     }
 
-    flush_transcript_window(&mut assembler, &mut stats, "shutdown");
+    finish_transcript_window(&mut assembler, &mut stats);
     stats
 }
 
@@ -224,7 +224,22 @@ fn flush_transcript_window(
     stats: &mut TranscriptStats,
     reason: &'static str,
 ) {
-    let Some(chunk) = assembler.flush() else {
+    record_transcript_chunk(assembler.flush(), stats, reason);
+}
+
+fn finish_transcript_window(
+    assembler: &mut TranscriptWindowAssembler,
+    stats: &mut TranscriptStats,
+) {
+    record_transcript_chunk(assembler.finish(), stats, "shutdown");
+}
+
+fn record_transcript_chunk(
+    chunk: Option<TranscriptChunk>,
+    stats: &mut TranscriptStats,
+    reason: &'static str,
+) {
+    let Some(chunk) = chunk else {
         return;
     };
 

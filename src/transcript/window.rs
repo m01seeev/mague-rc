@@ -54,6 +54,22 @@ impl TranscriptWindowAssembler {
         Some(self.chunk(text))
     }
 
+    pub fn finish(&mut self) -> Option<TranscriptChunk> {
+        let mut parts = std::mem::take(&mut self.pending_finals);
+        if let Some(interim) = novel_text(&self.sent_interim, &self.current_interim) {
+            parts.push(interim);
+        }
+        self.current_interim.clear();
+        self.sent_interim.clear();
+
+        let text = parts.join(" ");
+        if char_count(&text) < self.min_utterance_chars {
+            return None;
+        }
+
+        Some(self.chunk(text))
+    }
+
     fn chunk(&mut self, text: String) -> TranscriptChunk {
         let chunk = TranscriptChunk {
             sequence: self.next_sequence,
@@ -179,9 +195,22 @@ mod tests {
         assembler.push_transcript("незаконченный вопрос", false);
 
         assert_eq!(
-            text(assembler.flush()),
+            text(assembler.finish()),
             Some("незаконченный вопрос".to_owned())
         );
+    }
+
+    #[test]
+    fn shutdown_flush_combines_pending_final_and_new_interim() {
+        let mut assembler = assembler();
+        assembler.push_transcript("подтвержденная часть", true);
+        assembler.push_transcript("новый незаконченный хвост", false);
+
+        assert_eq!(
+            text(assembler.finish()),
+            Some("подтвержденная часть новый незаконченный хвост".to_owned())
+        );
+        assert_eq!(assembler.finish(), None);
     }
 
     #[test]
