@@ -2,7 +2,7 @@
 
 `mague-rc` is a local, terminal-first AI assistant for technical interviews, designed primarily for tiling window managers on Linux. Traditional desktop environments already have comparable assistant and overlay options, while tiling setups need a lightweight tool that integrates cleanly without replacing the window-management workflow.
 
-The initial target is Wayland with Hyprland. Stages 0 and 1 currently provide typed environment configuration, validation, structured logging, and graceful Ctrl+C shutdown. Audio capture, AI providers, and the overlay are intentionally introduced in later stages.
+The initial target is Wayland with Hyprland. The current implementation provides typed environment configuration, structured logging, graceful shutdown, and continuous system-audio capture through `ffmpeg`. AI providers and the overlay are intentionally introduced in later stages.
 
 ## Requirements
 
@@ -27,7 +27,15 @@ Environment variables override values loaded from `.env`. Use `RUST_LOG` to cont
 cargo run
 ```
 
-The process validates configuration, prints a startup event, waits for Ctrl+C, then exits cleanly. No external API requests are made in the current stage.
+The process validates configuration, starts `ffmpeg`, and reads raw PCM from the configured PulseAudio-compatible source. It logs a counter every 100 audio frames and restarts `ffmpeg` after an unexpected exit. Press Ctrl+C to stop both the application and its child process cleanly.
+
+To list available PipeWire/PulseAudio sources:
+
+```bash
+pactl list short sources
+```
+
+Play system audio while the application is running. With the default 100 ms chunk size, a successful capture reports `PCM audio frames captured` roughly every 10 seconds.
 
 ## Checks
 
@@ -40,6 +48,6 @@ cargo test
 
 ## Current scope
 
-Implemented: project scaffold, typed configuration, validation, redacted secrets, tracing, and graceful Ctrl+C shutdown.
+Implemented: project scaffold, typed configuration, validation, redacted secrets, tracing, continuous PCM capture through `ffmpeg`, bounded/unbounded audio queues, automatic capture restart, frame diagnostics, and graceful Ctrl+C shutdown.
 
-Not implemented: ffmpeg capture, Deepgram, fixed transcript windows, OpenRouter, RAG, OCR, and Wayland GUI. These are introduced only in their corresponding later stages.
+Not implemented: Deepgram, fixed transcript windows, OpenRouter, RAG, OCR, and Wayland GUI. These are introduced only in their corresponding later stages.
