@@ -10,12 +10,15 @@ use tracing::{info, warn};
 use crate::{
     audio::{AudioError, AudioFrameReceiver, AudioSource, FfmpegAudioSource, audio_frame_channel},
     config::Config,
+    control::TerminalEchoGuard,
     error::AppError,
 };
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub async fn run(config: Config) -> Result<(), AppError> {
+    let _terminal_echo_guard = TerminalEchoGuard::hide_control_characters();
+
     info!(
         module = "app",
         event = "started",
