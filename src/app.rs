@@ -3,17 +3,18 @@ use std::time::Duration;
 use tokio::{
     sync::{mpsc, watch},
     task::{JoinError, JoinHandle},
-    time::timeout,
+    time::{Instant, MissedTickBehavior, interval_at, timeout},
 };
 use tracing::{debug, info, warn};
 
 use crate::{
     audio::{AudioError, AudioSource, FfmpegAudioSource, audio_frame_channel},
-    config::Config,
+    config::{Config, TranscriptConfig},
     control::TerminalEchoGuard,
     error::AppError,
     events::DeepgramEvent,
     stt::{DeepgramSttProvider, SpeechToTextProvider, SttError},
+    transcript::TranscriptWindowAssembler,
 };
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -26,6 +27,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         event = "started",
         audio_source = %config.audio.source,
         stt_model = %config.deepgram.model,
+        transcript_window_sec = config.transcript.window_sec,
         "mague-rc started; press Ctrl+C to stop"
     );
 
@@ -43,11 +45,12 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     let mut audio_task = tokio::spawn(audio_source.run(frame_sender, shutdown_receiver.clone()));
     let mut stt_task =
         tokio::spawn(stt_provider.run(frame_receiver, event_sender, shutdown_receiver));
-    let mut event_task = tokio::spawn(print_deepgram_events(event_receiver));
+    let mut transcript_task =
+        tokio::spawn(run_transcript_windows(event_receiver, config.transcript));
 
     let mut audio_completed = None;
     let mut stt_completed = None;
-    let mut event_completed = None;
+    let mut transcript_completed = None;
 
     let stop_reason = tokio::select! {
         signal = tokio::signal::ctrl_c() => {
@@ -67,9 +70,9 @@ pub async fn run(config: Config) -> Result<(), AppError> {
             stt_completed = Some(result);
             StopReason::Stt
         }
-        result = &mut event_task => {
-            event_completed = Some(result);
-            StopReason::Events
+        result = &mut transcript_task => {
+            transcript_completed = Some(result);
+            StopReason::Transcript
         }
     };
 
@@ -83,7 +86,8 @@ pub async fn run(config: Config) -> Result<(), AppError> {
 
     let audio_result = finish_task("audio", &mut audio_task, audio_completed).await?;
     let stt_result = finish_task("stt", &mut stt_task, stt_completed).await?;
-    let event_stats = finish_task("STT output", &mut event_task, event_completed).await?;
+    let transcript_stats =
+        finish_task("transcript", &mut transcript_task, transcript_completed).await?;
 
     match stop_reason {
         StopReason::Signal => {
@@ -100,18 +104,19 @@ pub async fn run(config: Config) -> Result<(), AppError> {
             flatten_audio_task(audio_result)?;
             return Err(AppError::WorkerStopped("stt"));
         }
-        StopReason::Events => {
+        StopReason::Transcript => {
             flatten_audio_task(audio_result)?;
             flatten_stt_task(stt_result)?;
-            return Err(AppError::WorkerStopped("STT output"));
+            return Err(AppError::WorkerStopped("transcript"));
         }
     }
 
     info!(
         module = "app",
         event = "shutdown_completed",
-        transcript_events = event_stats.transcripts,
-        final_transcripts = event_stats.final_transcripts,
+        transcript_events = transcript_stats.transcripts,
+        final_transcripts = transcript_stats.final_transcripts,
+        transcript_chunks = transcript_stats.chunks,
         "mague-rc stopped cleanly"
     );
     Ok(())
@@ -122,72 +127,116 @@ enum StopReason {
     Signal,
     Audio,
     Stt,
-    Events,
+    Transcript,
 }
 
 #[derive(Default)]
 struct TranscriptStats {
     transcripts: u64,
     final_transcripts: u64,
+    chunks: u64,
 }
 
-async fn print_deepgram_events(
+async fn run_transcript_windows(
     mut events: mpsc::UnboundedReceiver<DeepgramEvent>,
+    config: TranscriptConfig,
 ) -> TranscriptStats {
     let mut stats = TranscriptStats::default();
+    let window_duration = Duration::from_secs(config.window_sec);
+    let mut ticker = interval_at(Instant::now() + window_duration, window_duration);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut assembler = TranscriptWindowAssembler::new(config.min_utterance_chars);
 
-    while let Some(event) = events.recv().await {
-        match event {
-            DeepgramEvent::Transcript {
-                text,
-                is_final,
-                speech_final,
-            } if !text.is_empty() => {
-                stats.transcripts += 1;
-                if is_final {
-                    stats.final_transcripts += 1;
-                    info!(
-                        module = "stt",
-                        event = "transcript_final",
-                        speech_final,
-                        text = %text,
-                        "FINAL transcript"
-                    );
-                } else {
-                    info!(
-                        module = "stt",
-                        event = "transcript_interim",
-                        text = %text,
-                        "interim transcript"
-                    );
-                }
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                flush_transcript_window(&mut assembler, &mut stats, "timer");
             }
-            DeepgramEvent::Transcript { .. } => {}
-            DeepgramEvent::SpeechStarted => debug!(
-                module = "stt",
-                event = "speech_started",
-                "Deepgram detected speech"
-            ),
-            DeepgramEvent::UtteranceEnd => debug!(
-                module = "stt",
-                event = "utterance_end",
-                "Deepgram detected utterance end"
-            ),
-            DeepgramEvent::Metadata => debug!(
-                module = "stt",
-                event = "metadata",
-                "Deepgram metadata received"
-            ),
-            DeepgramEvent::Error(error) => warn!(
-                module = "stt",
-                event = "error",
-                error = %error,
-                "Deepgram error"
-            ),
+            event = events.recv() => match event {
+                Some(event) => handle_deepgram_event(event, &mut assembler, &mut stats),
+                None => break,
+            }
         }
     }
 
+    flush_transcript_window(&mut assembler, &mut stats, "shutdown");
     stats
+}
+
+fn handle_deepgram_event(
+    event: DeepgramEvent,
+    assembler: &mut TranscriptWindowAssembler,
+    stats: &mut TranscriptStats,
+) {
+    match event {
+        DeepgramEvent::Transcript {
+            text,
+            is_final,
+            speech_final,
+        } if !text.is_empty() => {
+            stats.transcripts += 1;
+            if is_final {
+                stats.final_transcripts += 1;
+                info!(
+                    module = "stt",
+                    event = "transcript_final",
+                    speech_final,
+                    text = %text,
+                    "FINAL transcript"
+                );
+            } else {
+                info!(
+                    module = "stt",
+                    event = "transcript_interim",
+                    text = %text,
+                    "interim transcript"
+                );
+            }
+            assembler.push_transcript(&text, is_final);
+        }
+        DeepgramEvent::Transcript { .. } => {}
+        DeepgramEvent::SpeechStarted => debug!(
+            module = "stt",
+            event = "speech_started",
+            "Deepgram detected speech"
+        ),
+        DeepgramEvent::UtteranceEnd => debug!(
+            module = "stt",
+            event = "utterance_end",
+            "Deepgram detected utterance end"
+        ),
+        DeepgramEvent::Metadata => debug!(
+            module = "stt",
+            event = "metadata",
+            "Deepgram metadata received"
+        ),
+        DeepgramEvent::Error(error) => warn!(
+            module = "stt",
+            event = "error",
+            error = %error,
+            "Deepgram error"
+        ),
+    }
+}
+
+fn flush_transcript_window(
+    assembler: &mut TranscriptWindowAssembler,
+    stats: &mut TranscriptStats,
+    reason: &'static str,
+) {
+    let Some(chunk) = assembler.flush() else {
+        return;
+    };
+
+    stats.chunks += 1;
+    info!(
+        module = "transcript",
+        event = "window_flushed",
+        sequence = chunk.sequence,
+        reason,
+        text = %chunk.text,
+        "TRANSCRIPT WINDOW"
+    );
 }
 
 async fn finish_task<T>(

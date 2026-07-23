@@ -2,7 +2,7 @@
 
 `mague-rc` is a local, terminal-first AI assistant for technical interviews, designed primarily for tiling window managers on Linux. Traditional desktop environments already have comparable assistant and overlay options, while tiling setups need a lightweight tool that integrates cleanly without replacing the window-management workflow.
 
-The initial target is Wayland with Hyprland. The current implementation captures system audio through `ffmpeg`, streams raw PCM to Deepgram, and prints interim and final transcripts in the terminal. Text LLM providers and the overlay are intentionally introduced in later stages.
+The initial target is Wayland with Hyprland. The current implementation captures system audio through `ffmpeg`, streams raw PCM to Deepgram, and assembles recognition results into fixed transcript windows in the terminal. Text LLM providers and the overlay are intentionally introduced in later stages.
 
 ## Requirements
 
@@ -29,7 +29,7 @@ Environment variables override values loaded from `.env`. Use `RUST_LOG` to cont
 cargo run
 ```
 
-The process validates configuration, starts `ffmpeg`, and reads raw PCM from the configured PulseAudio-compatible source. PCM frames are streamed to Deepgram over an authenticated WebSocket and are not written to disk. Interim and final transcripts are printed as they arrive.
+The process validates configuration, starts `ffmpeg`, and reads raw PCM from the configured PulseAudio-compatible source. PCM frames are streamed to Deepgram over an authenticated WebSocket and are not written to disk. Interim and final transcripts are printed as diagnostics. Every `TRANSCRIPT_WINDOW_SEC` seconds, new recognized text is emitted as a separate `TRANSCRIPT WINDOW`; growing interim hypotheses only contribute their unsent tail. Text shorter than `MIN_UTTERANCE_CHARS` waits for more input.
 
 Both `ffmpeg` and Deepgram reconnect automatically. Audio frames remain queued in memory and preserve their order while Deepgram is reconnecting. Press Ctrl+C to close the WebSocket, stop `ffmpeg`, restore the terminal, and exit cleanly.
 
@@ -45,9 +45,10 @@ Play speech through the selected system-audio source while the application is ru
 Deepgram connected
 interim transcript
 FINAL transcript
+TRANSCRIPT WINDOW
 ```
 
-With the default 100 ms chunk size, audio capture also reports `PCM audio frames captured` roughly every 10 seconds.
+With the default 100 ms chunk size, audio capture also reports `PCM audio frames captured` roughly every 10 seconds. Stop the process while speech is still pending to verify that the last transcript window is flushed with `reason="shutdown"`.
 
 ## Checks
 
@@ -60,6 +61,6 @@ cargo test
 
 ## Current scope
 
-Implemented: typed configuration, redacted secrets, continuous PCM capture through `ffmpeg`, bounded/unbounded queues, authenticated Deepgram WebSocket streaming, keepalive, final/interim event parsing, ordered reconnect with retry, terminal transcript output, structured diagnostics, and graceful Ctrl+C shutdown.
+Implemented: typed configuration, redacted secrets, continuous PCM capture through `ffmpeg`, bounded/unbounded queues, authenticated Deepgram WebSocket streaming, keepalive, final/interim event parsing, ordered reconnect with retry, fixed transcript windows with interim deduplication and shutdown flush, structured diagnostics, and graceful Ctrl+C shutdown.
 
-Not implemented: fixed transcript windows, OpenRouter, RAG, OCR, and Wayland GUI. These are introduced only in their corresponding later stages.
+Not implemented: OpenRouter, RAG, OCR, and Wayland GUI. These are introduced only in their corresponding later stages.
