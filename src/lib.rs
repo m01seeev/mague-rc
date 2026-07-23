@@ -4,5 +4,7 @@ pub mod config;
 pub mod control;
 pub mod error;
 pub mod events;
+pub mod llm;
+pub mod output;
 pub mod stt;
 pub mod transcript;

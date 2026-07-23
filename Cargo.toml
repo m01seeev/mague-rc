@@ -4,8 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+async-stream = "0.3.6"
 dotenvy = "0.15.7"
+eventsource-stream = "0.2.3"
 futures-util = "0.3.31"
+reqwest = { version = "0.13.4", default-features = false, features = [
+    "json",
+    "rustls-no-provider",
+    "stream",
+] }
 rustls = { version = "0.23.42", default-features = false, features = ["ring", "std"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.142"
