@@ -243,9 +243,25 @@ impl FfmpegAudioSource {
             self.next_sequence = self.next_sequence.wrapping_add(1);
             filled = 0;
 
-            tokio::select! {
+            let send_result = tokio::select! {
                 _ = wait_for_shutdown(shutdown) => return Ok(ReadOutcome::Shutdown),
-                result = output.send(frame) => result?,
+                result = output.send(frame) => result,
+            };
+            if let Err(error) = send_result {
+                if shutdown_requested(shutdown) {
+                    return Ok(ReadOutcome::Shutdown);
+                }
+                return Err(error);
+            }
+
+            if self.next_sequence.is_multiple_of(100) {
+                info!(
+                    module = "audio",
+                    event = "frames_captured",
+                    frame_count = self.next_sequence,
+                    frame_bytes = chunk_size,
+                    "PCM audio frames captured"
+                );
             }
 
             let queue_len = output.len();

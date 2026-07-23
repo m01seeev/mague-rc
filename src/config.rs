@@ -22,12 +22,16 @@ const DEFAULT_DEEPGRAM_WS_URL: &str = "wss://api.deepgram.com/v1/listen";
 pub struct SecretString(String);
 
 impl SecretString {
-    fn new(value: String) -> Self {
+    pub(crate) fn new(value: String) -> Self {
         Self(value)
     }
 
     pub fn is_empty(&self) -> bool {
         self.0.trim().is_empty()
+    }
+
+    pub(crate) fn expose_secret(&self) -> &str {
+        &self.0
     }
 }
 

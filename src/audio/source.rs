@@ -115,6 +115,14 @@ impl AudioFrameReceiver {
         }
         frame
     }
+
+    pub fn len(&self) -> usize {
+        self.queued.load(Ordering::Relaxed)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl std::fmt::Debug for AudioFrameSender {

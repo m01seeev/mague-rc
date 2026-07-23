@@ -1,17 +1,19 @@
 use std::time::Duration;
 
 use tokio::{
-    sync::watch,
+    sync::{mpsc, watch},
     task::{JoinError, JoinHandle},
     time::timeout,
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
-    audio::{AudioError, AudioFrameReceiver, AudioSource, FfmpegAudioSource, audio_frame_channel},
+    audio::{AudioError, AudioSource, FfmpegAudioSource, audio_frame_channel},
     config::Config,
     control::TerminalEchoGuard,
     error::AppError,
+    events::DeepgramEvent,
+    stt::{DeepgramSttProvider, SpeechToTextProvider, SttError},
 };
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -24,21 +26,30 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         event = "started",
         audio_source = %config.audio.source,
         stt_model = %config.deepgram.model,
-        llm_model = %config.llm.model,
         "mague-rc started; press Ctrl+C to stop"
     );
 
     let (frame_sender, frame_receiver) = audio_frame_channel(config.audio.queue_max);
+    let (event_sender, event_receiver) = mpsc::unbounded_channel();
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
-    let source = FfmpegAudioSource::new(
+
+    let audio_source = FfmpegAudioSource::new(
         config.audio.clone(),
         config.deepgram.sample_rate,
         config.deepgram.channels,
     );
-    let mut audio_task = tokio::spawn(source.run(frame_sender, shutdown_receiver));
-    let frame_task = tokio::spawn(count_audio_frames(frame_receiver));
+    let stt_provider = DeepgramSttProvider::new(config.deepgram.clone());
 
-    tokio::select! {
+    let mut audio_task = tokio::spawn(audio_source.run(frame_sender, shutdown_receiver.clone()));
+    let mut stt_task =
+        tokio::spawn(stt_provider.run(frame_receiver, event_sender, shutdown_receiver));
+    let mut event_task = tokio::spawn(print_deepgram_events(event_receiver));
+
+    let mut audio_completed = None;
+    let mut stt_completed = None;
+    let mut event_completed = None;
+
+    let stop_reason = tokio::select! {
         signal = tokio::signal::ctrl_c() => {
             signal.map_err(AppError::Shutdown)?;
             info!(
@@ -46,78 +57,176 @@ pub async fn run(config: Config) -> Result<(), AppError> {
                 event = "shutdown_requested",
                 "shutdown signal received"
             );
+            StopReason::Signal
         }
         result = &mut audio_task => {
-            finish_frame_task(frame_task).await?;
-            flatten_audio_task(result)?;
-            return Err(AppError::AudioTaskStopped);
+            audio_completed = Some(result);
+            StopReason::Audio
         }
-    }
+        result = &mut stt_task => {
+            stt_completed = Some(result);
+            StopReason::Stt
+        }
+        result = &mut event_task => {
+            event_completed = Some(result);
+            StopReason::Events
+        }
+    };
 
     if shutdown_sender.send(true).is_err() {
-        warn!(
+        debug!(
             module = "app",
-            event = "shutdown_channel_closed",
-            "audio worker closed its shutdown channel"
+            event = "shutdown_channels_closed",
+            "pipeline workers already closed their shutdown channels"
         );
     }
 
-    match timeout(SHUTDOWN_TIMEOUT, &mut audio_task).await {
-        Ok(result) => flatten_audio_task(result)?,
-        Err(_) => {
-            audio_task.abort();
-            if let Err(error) = audio_task.await
-                && !error.is_cancelled()
-            {
-                warn!(
-                    module = "app",
-                    event = "audio_abort_failed",
-                    error = %error,
-                    "audio worker failed while being aborted"
-                );
-            }
-            finish_frame_task(frame_task).await?;
-            return Err(AppError::AudioShutdownTimeout);
+    let audio_result = finish_task("audio", &mut audio_task, audio_completed).await?;
+    let stt_result = finish_task("stt", &mut stt_task, stt_completed).await?;
+    let event_stats = finish_task("STT output", &mut event_task, event_completed).await?;
+
+    match stop_reason {
+        StopReason::Signal => {
+            flatten_audio_task(audio_result)?;
+            flatten_stt_task(stt_result)?;
+        }
+        StopReason::Audio => {
+            flatten_audio_task(audio_result)?;
+            flatten_stt_task(stt_result)?;
+            return Err(AppError::WorkerStopped("audio"));
+        }
+        StopReason::Stt => {
+            flatten_stt_task(stt_result)?;
+            flatten_audio_task(audio_result)?;
+            return Err(AppError::WorkerStopped("stt"));
+        }
+        StopReason::Events => {
+            flatten_audio_task(audio_result)?;
+            flatten_stt_task(stt_result)?;
+            return Err(AppError::WorkerStopped("STT output"));
         }
     }
 
-    let frame_count = finish_frame_task(frame_task).await?;
     info!(
         module = "app",
         event = "shutdown_completed",
-        frame_count,
+        transcript_events = event_stats.transcripts,
+        final_transcripts = event_stats.final_transcripts,
         "mague-rc stopped cleanly"
     );
     Ok(())
 }
 
-async fn count_audio_frames(mut receiver: AudioFrameReceiver) -> u64 {
-    let mut count = 0_u64;
+#[derive(Clone, Copy)]
+enum StopReason {
+    Signal,
+    Audio,
+    Stt,
+    Events,
+}
 
-    while let Some(frame) = receiver.recv().await {
-        count += 1;
-        if count.is_multiple_of(100) {
-            info!(
-                module = "audio",
-                event = "frames_captured",
-                frame_count = count,
-                sequence = frame.sequence,
-                frame_bytes = frame.pcm.len(),
-                "PCM audio frames captured"
-            );
+#[derive(Default)]
+struct TranscriptStats {
+    transcripts: u64,
+    final_transcripts: u64,
+}
+
+async fn print_deepgram_events(
+    mut events: mpsc::UnboundedReceiver<DeepgramEvent>,
+) -> TranscriptStats {
+    let mut stats = TranscriptStats::default();
+
+    while let Some(event) = events.recv().await {
+        match event {
+            DeepgramEvent::Transcript {
+                text,
+                is_final,
+                speech_final,
+            } if !text.is_empty() => {
+                stats.transcripts += 1;
+                if is_final {
+                    stats.final_transcripts += 1;
+                    info!(
+                        module = "stt",
+                        event = "transcript_final",
+                        speech_final,
+                        text = %text,
+                        "FINAL transcript"
+                    );
+                } else {
+                    info!(
+                        module = "stt",
+                        event = "transcript_interim",
+                        text = %text,
+                        "interim transcript"
+                    );
+                }
+            }
+            DeepgramEvent::Transcript { .. } => {}
+            DeepgramEvent::SpeechStarted => debug!(
+                module = "stt",
+                event = "speech_started",
+                "Deepgram detected speech"
+            ),
+            DeepgramEvent::UtteranceEnd => debug!(
+                module = "stt",
+                event = "utterance_end",
+                "Deepgram detected utterance end"
+            ),
+            DeepgramEvent::Metadata => debug!(
+                module = "stt",
+                event = "metadata",
+                "Deepgram metadata received"
+            ),
+            DeepgramEvent::Error(error) => warn!(
+                module = "stt",
+                event = "error",
+                error = %error,
+                "Deepgram error"
+            ),
         }
     }
 
-    count
+    stats
 }
 
-async fn finish_frame_task(task: JoinHandle<u64>) -> Result<u64, AppError> {
-    task.await
-        .map_err(|error| AppError::AudioTask(format!("frame counter: {error}")))
+async fn finish_task<T>(
+    name: &'static str,
+    task: &mut JoinHandle<T>,
+    completed: Option<Result<T, JoinError>>,
+) -> Result<T, AppError> {
+    let result = match completed {
+        Some(result) => result,
+        None => match timeout(SHUTDOWN_TIMEOUT, &mut *task).await {
+            Ok(result) => result,
+            Err(_) => {
+                task.abort();
+                if let Err(error) = task.await
+                    && !error.is_cancelled()
+                {
+                    warn!(
+                        module = "app",
+                        event = "worker_abort_failed",
+                        worker = name,
+                        error = %error,
+                        "pipeline worker failed while being aborted"
+                    );
+                }
+                return Err(AppError::WorkerShutdownTimeout(name));
+            }
+        },
+    };
+
+    result.map_err(|error| AppError::WorkerTask {
+        worker: name,
+        error: error.to_string(),
+    })
 }
 
-fn flatten_audio_task(result: Result<Result<(), AudioError>, JoinError>) -> Result<(), AppError> {
-    result
-        .map_err(|error| AppError::AudioTask(format!("capture worker: {error}")))?
-        .map_err(AppError::Audio)
+fn flatten_audio_task(result: Result<(), AudioError>) -> Result<(), AppError> {
+    result.map_err(AppError::Audio)
+}
+
+fn flatten_stt_task(result: Result<(), SttError>) -> Result<(), AppError> {
+    result.map_err(AppError::Stt)
 }

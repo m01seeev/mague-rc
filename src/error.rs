@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::{audio::AudioError, config::ConfigError};
+use crate::{audio::AudioError, config::ConfigError, stt::SttError};
 
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -16,12 +16,15 @@ pub enum AppError {
     #[error(transparent)]
     Audio(#[from] AudioError),
 
-    #[error("audio worker task failed: {0}")]
-    AudioTask(String),
+    #[error(transparent)]
+    Stt(#[from] SttError),
 
-    #[error("audio worker stopped unexpectedly")]
-    AudioTaskStopped,
+    #[error("{worker} worker task failed: {error}")]
+    WorkerTask { worker: &'static str, error: String },
 
-    #[error("audio worker did not stop within the shutdown timeout")]
-    AudioShutdownTimeout,
+    #[error("{0} worker stopped unexpectedly")]
+    WorkerStopped(&'static str),
+
+    #[error("{0} worker did not stop within the shutdown timeout")]
+    WorkerShutdownTimeout(&'static str),
 }
