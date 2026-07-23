@@ -1,6 +1,12 @@
 use thiserror::Error;
 
-use crate::{audio::AudioError, config::ConfigError, stt::SttError};
+use crate::{
+    audio::AudioError,
+    config::ConfigError,
+    llm::{LlmError, LlmQueueError, LlmWorkerError},
+    output::TerminalOutputError,
+    stt::SttError,
+};
 
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -18,6 +24,18 @@ pub enum AppError {
 
     #[error(transparent)]
     Stt(#[from] SttError),
+
+    #[error(transparent)]
+    Llm(#[from] LlmError),
+
+    #[error(transparent)]
+    LlmQueue(#[from] LlmQueueError),
+
+    #[error(transparent)]
+    LlmWorker(#[from] LlmWorkerError),
+
+    #[error(transparent)]
+    TerminalOutput(#[from] TerminalOutputError),
 
     #[error("{worker} worker task failed: {error}")]
     WorkerTask { worker: &'static str, error: String },

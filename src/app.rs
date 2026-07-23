@@ -12,7 +12,11 @@ use crate::{
     config::{Config, TranscriptConfig},
     control::TerminalEchoGuard,
     error::AppError,
-    events::{DeepgramEvent, TranscriptChunk},
+    events::{DeepgramEvent, LlmCommand, LlmEvent, LlmRequest, Mode, TranscriptChunk},
+    llm::{
+        LlmQueueError, LlmRequestSender, LlmWorker, OpenRouterTextProvider, llm_request_channel,
+    },
+    output::{OutputSink, TerminalOutputSink},
     stt::{DeepgramSttProvider, SpeechToTextProvider, SttError},
     transcript::TranscriptWindowAssembler,
 };
@@ -27,12 +31,16 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         event = "started",
         audio_source = %config.audio.source,
         stt_model = %config.deepgram.model,
+        llm_model = %config.llm.model,
         transcript_window_sec = config.transcript.window_sec,
         "mague-rc started; press Ctrl+C to stop"
     );
 
     let (frame_sender, frame_receiver) = audio_frame_channel(config.audio.queue_max);
-    let (event_sender, event_receiver) = mpsc::unbounded_channel();
+    let (stt_event_sender, stt_event_receiver) = mpsc::unbounded_channel();
+    let (llm_request_sender, llm_request_receiver) = llm_request_channel(config.llm.queue_max);
+    let (llm_event_sender, llm_event_receiver) = mpsc::unbounded_channel::<LlmEvent>();
+    let (_llm_command_sender, llm_command_receiver) = mpsc::unbounded_channel::<LlmCommand>();
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
 
     let audio_source = FfmpegAudioSource::new(
@@ -41,16 +49,26 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         config.deepgram.channels,
     );
     let stt_provider = DeepgramSttProvider::new(config.deepgram.clone());
+    let llm_provider = OpenRouterTextProvider::new(config.llm.clone())?;
+    let llm_worker = LlmWorker::new(llm_provider, config.llm);
 
     let mut audio_task = tokio::spawn(audio_source.run(frame_sender, shutdown_receiver.clone()));
     let mut stt_task =
-        tokio::spawn(stt_provider.run(frame_receiver, event_sender, shutdown_receiver));
-    let mut transcript_task =
-        tokio::spawn(run_transcript_windows(event_receiver, config.transcript));
+        tokio::spawn(stt_provider.run(frame_receiver, stt_event_sender, shutdown_receiver));
+    let mut transcript_task = tokio::spawn(run_transcript_windows(
+        stt_event_receiver,
+        llm_request_sender,
+        config.transcript,
+    ));
+    let mut llm_task =
+        tokio::spawn(llm_worker.run(llm_request_receiver, llm_command_receiver, llm_event_sender));
+    let mut output_task = tokio::spawn(TerminalOutputSink.run(llm_event_receiver));
 
     let mut audio_completed = None;
     let mut stt_completed = None;
     let mut transcript_completed = None;
+    let mut llm_completed = None;
+    let mut output_completed = None;
 
     let stop_reason = tokio::select! {
         signal = tokio::signal::ctrl_c() => {
@@ -74,6 +92,14 @@ pub async fn run(config: Config) -> Result<(), AppError> {
             transcript_completed = Some(result);
             StopReason::Transcript
         }
+        result = &mut llm_task => {
+            llm_completed = Some(result);
+            StopReason::Llm
+        }
+        result = &mut output_task => {
+            output_completed = Some(result);
+            StopReason::Output
+        }
     };
 
     if shutdown_sender.send(true).is_err() {
@@ -88,27 +114,17 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     let stt_result = finish_task("stt", &mut stt_task, stt_completed).await?;
     let transcript_stats =
         finish_task("transcript", &mut transcript_task, transcript_completed).await?;
+    let llm_stats = finish_task("LLM", &mut llm_task, llm_completed).await?;
+    let output_stats = finish_task("terminal output", &mut output_task, output_completed).await?;
 
-    match stop_reason {
-        StopReason::Signal => {
-            flatten_audio_task(audio_result)?;
-            flatten_stt_task(stt_result)?;
-        }
-        StopReason::Audio => {
-            flatten_audio_task(audio_result)?;
-            flatten_stt_task(stt_result)?;
-            return Err(AppError::WorkerStopped("audio"));
-        }
-        StopReason::Stt => {
-            flatten_stt_task(stt_result)?;
-            flatten_audio_task(audio_result)?;
-            return Err(AppError::WorkerStopped("stt"));
-        }
-        StopReason::Transcript => {
-            flatten_audio_task(audio_result)?;
-            flatten_stt_task(stt_result)?;
-            return Err(AppError::WorkerStopped("transcript"));
-        }
+    flatten_audio_task(audio_result)?;
+    flatten_stt_task(stt_result)?;
+    let transcript_stats = transcript_stats.map_err(AppError::LlmQueue)?;
+    let llm_stats = llm_stats.map_err(AppError::LlmWorker)?;
+    let output_stats = output_stats.map_err(AppError::TerminalOutput)?;
+
+    if let Some(worker) = stop_reason.unexpected_worker() {
+        return Err(AppError::WorkerStopped(worker));
     }
 
     info!(
@@ -117,6 +133,10 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         transcript_events = transcript_stats.transcripts,
         final_transcripts = transcript_stats.final_transcripts,
         transcript_chunks = transcript_stats.chunks,
+        llm_requests = llm_stats.requests,
+        llm_completed = llm_stats.completed,
+        llm_failed = llm_stats.failed,
+        answers_completed = output_stats.completed,
         "mague-rc stopped cleanly"
     );
     Ok(())
@@ -128,6 +148,21 @@ enum StopReason {
     Audio,
     Stt,
     Transcript,
+    Llm,
+    Output,
+}
+
+impl StopReason {
+    fn unexpected_worker(self) -> Option<&'static str> {
+        match self {
+            Self::Signal => None,
+            Self::Audio => Some("audio"),
+            Self::Stt => Some("stt"),
+            Self::Transcript => Some("transcript"),
+            Self::Llm => Some("LLM"),
+            Self::Output => Some("terminal output"),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -139,8 +174,9 @@ struct TranscriptStats {
 
 async fn run_transcript_windows(
     mut events: mpsc::UnboundedReceiver<DeepgramEvent>,
+    llm_requests: LlmRequestSender,
     config: TranscriptConfig,
-) -> TranscriptStats {
+) -> Result<TranscriptStats, LlmQueueError> {
     let mut stats = TranscriptStats::default();
     let window_duration = Duration::from_secs(config.window_sec);
     let mut ticker = interval_at(Instant::now() + window_duration, window_duration);
@@ -150,7 +186,13 @@ async fn run_transcript_windows(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                flush_transcript_window(&mut assembler, &mut stats, "timer");
+                flush_transcript_window(
+                    &mut assembler,
+                    &llm_requests,
+                    &mut stats,
+                    "timer",
+                )
+                .await?;
             }
             event = events.recv() => match event {
                 Some(event) => handle_deepgram_event(event, &mut assembler, &mut stats),
@@ -159,8 +201,8 @@ async fn run_transcript_windows(
         }
     }
 
-    finish_transcript_window(&mut assembler, &mut stats);
-    stats
+    finish_transcript_window(&mut assembler, &llm_requests, &mut stats).await?;
+    Ok(stats)
 }
 
 fn handle_deepgram_event(
@@ -219,39 +261,61 @@ fn handle_deepgram_event(
     }
 }
 
-fn flush_transcript_window(
+async fn flush_transcript_window(
     assembler: &mut TranscriptWindowAssembler,
+    llm_requests: &LlmRequestSender,
     stats: &mut TranscriptStats,
     reason: &'static str,
-) {
-    record_transcript_chunk(assembler.flush(), stats, reason);
+) -> Result<(), LlmQueueError> {
+    queue_transcript_chunk(assembler.flush(), llm_requests, stats, reason).await
 }
 
-fn finish_transcript_window(
+async fn finish_transcript_window(
     assembler: &mut TranscriptWindowAssembler,
+    llm_requests: &LlmRequestSender,
     stats: &mut TranscriptStats,
-) {
-    record_transcript_chunk(assembler.finish(), stats, "shutdown");
+) -> Result<(), LlmQueueError> {
+    queue_transcript_chunk(assembler.finish(), llm_requests, stats, "shutdown").await
 }
 
-fn record_transcript_chunk(
+async fn queue_transcript_chunk(
     chunk: Option<TranscriptChunk>,
+    llm_requests: &LlmRequestSender,
     stats: &mut TranscriptStats,
     reason: &'static str,
-) {
+) -> Result<(), LlmQueueError> {
     let Some(chunk) = chunk else {
-        return;
+        return Ok(());
     };
 
-    stats.chunks += 1;
+    let request_id = chunk.sequence;
     info!(
         module = "transcript",
         event = "window_flushed",
-        sequence = chunk.sequence,
+        sequence = request_id,
         reason,
         text = %chunk.text,
         "TRANSCRIPT WINDOW"
     );
+    llm_requests
+        .send(LlmRequest {
+            request_id,
+            mode: Mode::Voice,
+            text: chunk.text,
+        })
+        .await?;
+    stats.chunks += 1;
+
+    let queue_len = llm_requests.len();
+    if queue_len > 1 {
+        warn!(
+            module = "llm",
+            event = "queue_growing",
+            queue_len,
+            "LLM request queue is growing"
+        );
+    }
+    Ok(())
 }
 
 async fn finish_task<T>(
@@ -293,4 +357,43 @@ fn flatten_audio_task(result: Result<(), AudioError>) -> Result<(), AppError> {
 
 fn flatten_stt_task(result: Result<(), SttError>) -> Result<(), AppError> {
     result.map_err(AppError::Stt)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shutdown_flush_queues_a_voice_request() {
+        let (event_sender, event_receiver) = mpsc::unbounded_channel();
+        let (request_sender, mut request_receiver) = llm_request_channel(0);
+        event_sender
+            .send(DeepgramEvent::Transcript {
+                text: "Что такое HashMap?".to_owned(),
+                is_final: true,
+                speech_final: true,
+            })
+            .expect("STT event must send");
+        drop(event_sender);
+
+        let stats = run_transcript_windows(
+            event_receiver,
+            request_sender,
+            TranscriptConfig {
+                window_sec: 60,
+                min_utterance_chars: 3,
+            },
+        )
+        .await
+        .expect("transcript worker must stop cleanly");
+        let request = request_receiver
+            .recv()
+            .await
+            .expect("shutdown flush must queue a request");
+
+        assert_eq!(stats.chunks, 1);
+        assert_eq!(request.request_id, 0);
+        assert_eq!(request.mode, Mode::Voice);
+        assert_eq!(request.text, "Что такое HashMap?");
+    }
 }
