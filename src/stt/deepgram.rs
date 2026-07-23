@@ -46,6 +46,9 @@ type DeepgramReader = SplitStream<DeepgramSocket>;
 
 #[derive(Debug, Error)]
 pub enum SttError {
+    #[error("failed to install the rustls crypto provider")]
+    CryptoProvider,
+
     #[error("audio frame channel closed while STT was running")]
     AudioChannelClosed,
 
@@ -57,6 +60,24 @@ pub enum SttError {
 
     #[error("Deepgram task failed: {0}")]
     Task(String),
+}
+
+pub fn install_tls_crypto_provider() -> Result<(), SttError> {
+    use rustls::crypto::CryptoProvider;
+
+    if CryptoProvider::get_default().is_some() {
+        return Ok(());
+    }
+
+    if rustls::crypto::ring::default_provider()
+        .install_default()
+        .is_err()
+        && CryptoProvider::get_default().is_none()
+    {
+        return Err(SttError::CryptoProvider);
+    }
+
+    Ok(())
 }
 
 pub struct DeepgramSttProvider {
@@ -715,6 +736,12 @@ mod tests {
             vec!["Java", "Spring Boot"]
         );
         assert!(!url.as_str().contains("secret"));
+    }
+
+    #[test]
+    fn installs_crypto_provider_before_building_tls_config() {
+        install_tls_crypto_provider().expect("ring provider must be installed");
+        let _builder = rustls::ClientConfig::builder();
     }
 
     #[test]

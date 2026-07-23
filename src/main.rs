@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-use mague_rc::{app, config::Config, error::AppError};
+use mague_rc::{app, config::Config, error::AppError, stt::install_tls_crypto_provider};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -16,6 +16,7 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<(), AppError> {
     init_tracing()?;
+    install_tls_crypto_provider()?;
     let config = Config::load()?;
     app::run(config).await
 }
