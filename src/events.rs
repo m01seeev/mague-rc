@@ -16,3 +16,9 @@ pub enum DeepgramEvent {
     Metadata,
     Error(String),
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranscriptChunk {
+    pub sequence: u64,
+    pub text: String,
+}
