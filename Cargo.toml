@@ -7,6 +7,7 @@ edition = "2024"
 async-stream = "0.3.6"
 dotenvy = "0.15.7"
 eventsource-stream = "0.2.3"
+futures-channel = "0.3.31"
 futures-util = "0.3.31"
 reqwest = { version = "0.13.4", default-features = false, features = [
     "json",
@@ -33,10 +34,5 @@ tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
     "rustls-tls-native-roots",
 ] }
 url = "2.5.4"
-iced_layershell = "0.19.1"
-iced = { version = "0.14.0", default-features = false, features = [
-    "tiny-skia",
-    "tokio",
-    "wayland",
-] }
-lucide-icons = { version = "1.25.0", features = ["iced"] }
+gtk = { package = "gtk4", version = "0.11.4", features = ["v4_16"] }
+gtk4-layer-shell = "0.8.0"

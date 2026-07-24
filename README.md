@@ -9,8 +9,15 @@ The initial target is Wayland with Hyprland. The current implementation captures
 - Rust stable
 - `ffmpeg` available through `PATH`, or an executable path set in `FFMPEG_BIN`
 - PipeWire with a PulseAudio-compatible server
+- GTK4 and GTK4 Layer Shell
 - a Wayland compositor with layer-shell support, such as Hyprland
 - Network access to Deepgram and OpenRouter
+
+On Arch Linux:
+
+```bash
+sudo pacman -S --needed gtk4 gtk4-layer-shell
+```
 
 ## Configuration
 
@@ -30,7 +37,7 @@ Environment variables override values loaded from `.env`. The default tracing le
 cargo run
 ```
 
-This opens a transparent layer-shell panel anchored to the top-right of the active output. The panel stays above regular windows without taking keyboard focus. Its controls pause/resume new transcript windows, clear LLM conversation history, collapse/expand the panel, and shut the pipeline down cleanly. Pausing prevents new questions and answers while keeping audio capture and the Deepgram connection alive.
+This opens a GTK4 layer-shell panel anchored to the top-right of the active output. The panel stays above regular windows without taking keyboard focus. Its controls pause/resume new transcript windows, clear LLM conversation history, collapse/expand the panel, and shut the pipeline down cleanly. Pausing prevents new questions and answers while keeping audio capture and the Deepgram connection alive.
 
 For the diagnostic terminal output instead:
 
