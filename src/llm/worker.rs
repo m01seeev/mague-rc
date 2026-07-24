@@ -7,7 +7,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     config::LlmConfig,
-    events::{LlmCommand, LlmEvent, LlmRequest},
+    events::{AnswerMeta, AppErrorView, LlmCommand, LlmRequest, OutputComponent, OutputEvent},
     llm::{
         ChatMessage, ChatRequest, ConversationHistories, LlmError, LlmRequestReceiver,
         TextLlmProvider, voice_system_prompt,
@@ -51,7 +51,7 @@ where
         mut self,
         mut requests: LlmRequestReceiver,
         mut commands: mpsc::UnboundedReceiver<LlmCommand>,
-        events: mpsc::UnboundedSender<LlmEvent>,
+        events: mpsc::UnboundedSender<OutputEvent>,
     ) -> Result<LlmWorkerStats, LlmWorkerError> {
         let mut stats = LlmWorkerStats::default();
         let mut commands_open = true;
@@ -83,10 +83,10 @@ where
             let queue_len = requests.len();
             send_event(
                 &events,
-                LlmEvent::Started {
+                OutputEvent::AnswerStarted(AnswerMeta {
                     request_id: request.request_id,
                     mode: request.mode,
-                },
+                }),
             )?;
 
             info!(
@@ -107,9 +107,8 @@ where
                     stats.completed += 1;
                     send_event(
                         &events,
-                        LlmEvent::Completed {
+                        OutputEvent::AnswerCompleted {
                             request_id: request.request_id,
-                            full_text,
                         },
                     )?;
                 }
@@ -127,10 +126,10 @@ where
                     );
                     send_event(
                         &events,
-                        LlmEvent::Failed {
-                            request_id: request.request_id,
-                            error: error.to_string(),
-                        },
+                        OutputEvent::Error(AppErrorView {
+                            component: OutputComponent::Llm,
+                            message: format!("request #{} failed: {error}", request.request_id),
+                        }),
                     )?;
                 }
             }
@@ -142,7 +141,7 @@ where
     async fn process_request(
         &self,
         request: &LlmRequest,
-        events: &mpsc::UnboundedSender<LlmEvent>,
+        events: &mpsc::UnboundedSender<OutputEvent>,
     ) -> Result<String, LlmError> {
         let history = self.histories.messages(request.mode);
         let mut messages = Vec::with_capacity(2 + history.len());
@@ -182,7 +181,7 @@ where
                         full_text.push_str(&delta);
                         send_event(
                             events,
-                            LlmEvent::Delta {
+                            OutputEvent::AnswerDelta {
                                 request_id: request.request_id,
                                 text: delta,
                             },
@@ -215,8 +214,8 @@ where
 }
 
 fn send_event(
-    sender: &mpsc::UnboundedSender<LlmEvent>,
-    event: LlmEvent,
+    sender: &mpsc::UnboundedSender<OutputEvent>,
+    event: OutputEvent,
 ) -> Result<(), LlmWorkerError> {
     sender
         .send(event)
@@ -305,7 +304,7 @@ mod tests {
             .expect("worker must succeed");
         let mut completed = Vec::new();
         while let Some(event) = event_receiver.recv().await {
-            if let LlmEvent::Completed { request_id, .. } = event {
+            if let OutputEvent::AnswerCompleted { request_id } = event {
                 completed.push(request_id);
             }
         }
@@ -337,7 +336,7 @@ mod tests {
 
         sender.send(request(1)).await.expect("send must succeed");
         while let Some(event) = event_receiver.recv().await {
-            if matches!(event, LlmEvent::Completed { request_id: 1, .. }) {
+            if matches!(event, OutputEvent::AnswerCompleted { request_id: 1 }) {
                 break;
             }
         }

@@ -28,7 +28,7 @@ use url::Url;
 use crate::{
     audio::AudioFrameReceiver,
     config::DeepgramConfig,
-    events::{AudioFrame, DeepgramEvent},
+    events::{AudioFrame, DeepgramEvent, SttStatus},
     stt::{SpeechToTextProvider, parse_server_message},
 };
 
@@ -104,6 +104,13 @@ impl DeepgramSttProvider {
             }
 
             let queue_len = audio.len() + usize::from(retry_frame.is_some());
+            emit_event(
+                &events,
+                DeepgramEvent::Status(SttStatus::Connecting {
+                    retry_count,
+                    queue_len,
+                }),
+            )?;
             info!(
                 module = "stt",
                 event = "connecting",
@@ -123,11 +130,15 @@ impl DeepgramSttProvider {
                 Err(error) => {
                     retry_count = retry_count.saturating_add(1);
                     emit_error(&events, format!("Deepgram connection failed: {error}"))?;
-                    wait_before_reconnect(retry_count, &mut shutdown).await;
+                    wait_before_reconnect(retry_count, queue_len, &events, &mut shutdown).await?;
                     continue;
                 }
             };
 
+            emit_event(
+                &events,
+                DeepgramEvent::Status(SttStatus::Connected { queue_len }),
+            )?;
             info!(
                 module = "stt",
                 event = "connected",
@@ -172,7 +183,8 @@ impl DeepgramSttProvider {
                 }
             }
 
-            wait_before_reconnect(retry_count, &mut shutdown).await;
+            let queue_len = audio.len() + usize::from(retry_frame.is_some());
+            wait_before_reconnect(retry_count, queue_len, &events, &mut shutdown).await?;
         }
     }
 
@@ -607,13 +619,31 @@ fn emit_error(
         error = %message,
         "Deepgram provider error"
     );
-    events
-        .send(DeepgramEvent::Error(message))
-        .map_err(|_| SttError::EventChannelClosed)
+    emit_event(events, DeepgramEvent::Error(message))
 }
 
-async fn wait_before_reconnect(retry_count: u32, shutdown: &mut watch::Receiver<bool>) {
+fn emit_event(
+    events: &mpsc::UnboundedSender<DeepgramEvent>,
+    event: DeepgramEvent,
+) -> Result<(), SttError> {
+    events.send(event).map_err(|_| SttError::EventChannelClosed)
+}
+
+async fn wait_before_reconnect(
+    retry_count: u32,
+    queue_len: usize,
+    events: &mpsc::UnboundedSender<DeepgramEvent>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<(), SttError> {
     let delay = reconnect_delay(retry_count);
+    emit_event(
+        events,
+        DeepgramEvent::Status(SttStatus::Reconnecting {
+            retry_count,
+            delay_secs: delay.as_secs(),
+            queue_len,
+        }),
+    )?;
     info!(
         module = "stt",
         event = "reconnect_wait",
@@ -627,6 +657,7 @@ async fn wait_before_reconnect(retry_count: u32, shutdown: &mut watch::Receiver<
         _ = wait_for_shutdown(shutdown) => {}
         _ = sleep(delay) => {}
     }
+    Ok(())
 }
 
 fn reconnect_delay(retry_count: u32) -> Duration {

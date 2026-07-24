@@ -185,7 +185,7 @@ impl FfmpegAudioSource {
         command
             .arg("-hide_banner")
             .arg("-loglevel")
-            .arg("warning")
+            .arg("error")
             .arg("-f")
             .arg(&self.config.input_format)
             .arg("-i")

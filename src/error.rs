@@ -1,6 +1,7 @@
 use thiserror::Error;
 
 use crate::{
+    app::TranscriptWorkerError,
     audio::AudioError,
     config::ConfigError,
     llm::{LlmError, LlmQueueError, LlmWorkerError},
@@ -33,6 +34,9 @@ pub enum AppError {
 
     #[error(transparent)]
     LlmWorker(#[from] LlmWorkerError),
+
+    #[error(transparent)]
+    TranscriptWorker(#[from] TranscriptWorkerError),
 
     #[error(transparent)]
     TerminalOutput(#[from] TerminalOutputError),

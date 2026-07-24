@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use thiserror::Error;
 use tokio::{
     sync::{mpsc, watch},
     task::{JoinError, JoinHandle},
@@ -12,7 +13,11 @@ use crate::{
     config::{Config, TranscriptConfig},
     control::TerminalEchoGuard,
     error::AppError,
-    events::{DeepgramEvent, LlmCommand, LlmEvent, LlmRequest, Mode, TranscriptChunk},
+    events::{
+        AppErrorView, DeepgramEvent, LlmCommand, LlmRequest, Mode, OutputComponent, OutputEvent,
+        QueueKind, QueueState, StatusKind, StatusMessage, SttStatus, TranscriptChunk,
+        TranscriptView,
+    },
     llm::{
         LlmQueueError, LlmRequestSender, LlmWorker, OpenRouterTextProvider, llm_request_channel,
     },
@@ -39,9 +44,20 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     let (frame_sender, frame_receiver) = audio_frame_channel(config.audio.queue_max);
     let (stt_event_sender, stt_event_receiver) = mpsc::unbounded_channel();
     let (llm_request_sender, llm_request_receiver) = llm_request_channel(config.llm.queue_max);
-    let (llm_event_sender, llm_event_receiver) = mpsc::unbounded_channel::<LlmEvent>();
+    let (output_sender, output_receiver) = mpsc::unbounded_channel::<OutputEvent>();
     let (_llm_command_sender, llm_command_receiver) = mpsc::unbounded_channel::<LlmCommand>();
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
+
+    send_output(
+        &output_sender,
+        OutputEvent::Status(StatusMessage {
+            kind: StatusKind::Started,
+            text: format!(
+                "source={} | STT={} | LLM={}",
+                config.audio.source, config.deepgram.model, config.llm.model
+            ),
+        }),
+    )?;
 
     let audio_source = FfmpegAudioSource::new(
         config.audio.clone(),
@@ -58,11 +74,15 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     let mut transcript_task = tokio::spawn(run_transcript_windows(
         stt_event_receiver,
         llm_request_sender,
+        output_sender.clone(),
         config.transcript,
     ));
-    let mut llm_task =
-        tokio::spawn(llm_worker.run(llm_request_receiver, llm_command_receiver, llm_event_sender));
-    let mut output_task = tokio::spawn(TerminalOutputSink.run(llm_event_receiver));
+    let mut llm_task = tokio::spawn(llm_worker.run(
+        llm_request_receiver,
+        llm_command_receiver,
+        output_sender.clone(),
+    ));
+    let mut output_task = tokio::spawn(TerminalOutputSink.run(output_receiver));
 
     let mut audio_completed = None;
     let mut stt_completed = None;
@@ -115,11 +135,25 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     let transcript_stats =
         finish_task("transcript", &mut transcript_task, transcript_completed).await?;
     let llm_stats = finish_task("LLM", &mut llm_task, llm_completed).await?;
+    if output_sender
+        .send(OutputEvent::Status(StatusMessage {
+            kind: StatusKind::Stopped,
+            text: "mague-rc stopped cleanly".to_owned(),
+        }))
+        .is_err()
+    {
+        debug!(
+            module = "app",
+            event = "output_channel_closed",
+            "output channel closed before shutdown status"
+        );
+    }
+    drop(output_sender);
     let output_stats = finish_task("terminal output", &mut output_task, output_completed).await?;
 
     flatten_audio_task(audio_result)?;
     flatten_stt_task(stt_result)?;
-    let transcript_stats = transcript_stats.map_err(AppError::LlmQueue)?;
+    let transcript_stats = transcript_stats.map_err(AppError::TranscriptWorker)?;
     let llm_stats = llm_stats.map_err(AppError::LlmWorker)?;
     let output_stats = output_stats.map_err(AppError::TerminalOutput)?;
 
@@ -175,8 +209,9 @@ struct TranscriptStats {
 async fn run_transcript_windows(
     mut events: mpsc::UnboundedReceiver<DeepgramEvent>,
     llm_requests: LlmRequestSender,
+    output: mpsc::UnboundedSender<OutputEvent>,
     config: TranscriptConfig,
-) -> Result<TranscriptStats, LlmQueueError> {
+) -> Result<TranscriptStats, TranscriptWorkerError> {
     let mut stats = TranscriptStats::default();
     let window_duration = Duration::from_secs(config.window_sec);
     let mut ticker = interval_at(Instant::now() + window_duration, window_duration);
@@ -189,28 +224,31 @@ async fn run_transcript_windows(
                 flush_transcript_window(
                     &mut assembler,
                     &llm_requests,
+                    &output,
                     &mut stats,
                     "timer",
                 )
                 .await?;
             }
             event = events.recv() => match event {
-                Some(event) => handle_deepgram_event(event, &mut assembler, &mut stats),
+                Some(event) => handle_deepgram_event(event, &mut assembler, &output, &mut stats)?,
                 None => break,
             }
         }
     }
 
-    finish_transcript_window(&mut assembler, &llm_requests, &mut stats).await?;
+    finish_transcript_window(&mut assembler, &llm_requests, &output, &mut stats).await?;
     Ok(stats)
 }
 
 fn handle_deepgram_event(
     event: DeepgramEvent,
     assembler: &mut TranscriptWindowAssembler,
+    output: &mpsc::UnboundedSender<OutputEvent>,
     stats: &mut TranscriptStats,
-) {
+) -> Result<(), TranscriptWorkerError> {
     match event {
+        DeepgramEvent::Status(status) => handle_stt_status(status, output)?,
         DeepgramEvent::Transcript {
             text,
             is_final,
@@ -219,7 +257,7 @@ fn handle_deepgram_event(
             stats.transcripts += 1;
             if is_final {
                 stats.final_transcripts += 1;
-                info!(
+                debug!(
                     module = "stt",
                     event = "transcript_final",
                     speech_final,
@@ -227,7 +265,7 @@ fn handle_deepgram_event(
                     "FINAL transcript"
                 );
             } else {
-                info!(
+                debug!(
                     module = "stt",
                     event = "transcript_interim",
                     text = %text,
@@ -252,38 +290,94 @@ fn handle_deepgram_event(
             event = "metadata",
             "Deepgram metadata received"
         ),
-        DeepgramEvent::Error(error) => warn!(
-            module = "stt",
-            event = "error",
-            error = %error,
-            "Deepgram error"
-        ),
+        DeepgramEvent::Error(error) => {
+            warn!(
+                module = "stt",
+                event = "error",
+                error = %error,
+                "Deepgram error"
+            );
+            send_output(
+                output,
+                OutputEvent::Error(AppErrorView {
+                    component: OutputComponent::Stt,
+                    message: error,
+                }),
+            )?;
+        }
     }
+    Ok(())
+}
+
+fn handle_stt_status(
+    status: SttStatus,
+    output: &mpsc::UnboundedSender<OutputEvent>,
+) -> Result<(), TranscriptWorkerError> {
+    let (kind, text, queue_len) = match status {
+        SttStatus::Connecting {
+            retry_count,
+            queue_len,
+        } => (
+            StatusKind::Connecting,
+            if retry_count == 0 {
+                "connecting to Deepgram".to_owned()
+            } else {
+                format!("connecting to Deepgram (attempt {})", retry_count + 1)
+            },
+            queue_len,
+        ),
+        SttStatus::Connected { queue_len } => (
+            StatusKind::Listening,
+            "Deepgram connected; listening".to_owned(),
+            queue_len,
+        ),
+        SttStatus::Reconnecting {
+            retry_count,
+            delay_secs,
+            queue_len,
+        } => (
+            StatusKind::Reconnecting,
+            format!("Deepgram reconnect in {delay_secs}s (retry {retry_count})"),
+            queue_len,
+        ),
+    };
+
+    send_output(output, OutputEvent::Status(StatusMessage { kind, text }))?;
+    send_output(
+        output,
+        OutputEvent::QueueState(QueueState {
+            queue: QueueKind::Audio,
+            len: queue_len,
+        }),
+    )
 }
 
 async fn flush_transcript_window(
     assembler: &mut TranscriptWindowAssembler,
     llm_requests: &LlmRequestSender,
+    output: &mpsc::UnboundedSender<OutputEvent>,
     stats: &mut TranscriptStats,
     reason: &'static str,
-) -> Result<(), LlmQueueError> {
-    queue_transcript_chunk(assembler.flush(), llm_requests, stats, reason).await
+) -> Result<(), TranscriptWorkerError> {
+    queue_transcript_chunk(assembler.flush(), llm_requests, output, stats, reason).await
 }
 
 async fn finish_transcript_window(
     assembler: &mut TranscriptWindowAssembler,
     llm_requests: &LlmRequestSender,
+    output: &mpsc::UnboundedSender<OutputEvent>,
     stats: &mut TranscriptStats,
-) -> Result<(), LlmQueueError> {
-    queue_transcript_chunk(assembler.finish(), llm_requests, stats, "shutdown").await
+) -> Result<(), TranscriptWorkerError> {
+    queue_transcript_chunk(assembler.finish(), llm_requests, output, stats, "shutdown").await
 }
 
 async fn queue_transcript_chunk(
     chunk: Option<TranscriptChunk>,
     llm_requests: &LlmRequestSender,
+    output: &mpsc::UnboundedSender<OutputEvent>,
     stats: &mut TranscriptStats,
     reason: &'static str,
-) -> Result<(), LlmQueueError> {
+) -> Result<(), TranscriptWorkerError> {
     let Some(chunk) = chunk else {
         return Ok(());
     };
@@ -297,6 +391,13 @@ async fn queue_transcript_chunk(
         text = %chunk.text,
         "TRANSCRIPT WINDOW"
     );
+    send_output(
+        output,
+        OutputEvent::Transcript(TranscriptView {
+            sequence: request_id,
+            text: chunk.text.clone(),
+        }),
+    )?;
     llm_requests
         .send(LlmRequest {
             request_id,
@@ -307,6 +408,13 @@ async fn queue_transcript_chunk(
     stats.chunks += 1;
 
     let queue_len = llm_requests.len();
+    send_output(
+        output,
+        OutputEvent::QueueState(QueueState {
+            queue: QueueKind::Llm,
+            len: queue_len,
+        }),
+    )?;
     if queue_len > 1 {
         warn!(
             module = "llm",
@@ -316,6 +424,24 @@ async fn queue_transcript_chunk(
         );
     }
     Ok(())
+}
+
+fn send_output(
+    output: &mpsc::UnboundedSender<OutputEvent>,
+    event: OutputEvent,
+) -> Result<(), TranscriptWorkerError> {
+    output
+        .send(event)
+        .map_err(|_| TranscriptWorkerError::OutputChannelClosed)
+}
+
+#[derive(Debug, Error)]
+pub enum TranscriptWorkerError {
+    #[error(transparent)]
+    LlmQueue(#[from] LlmQueueError),
+
+    #[error("output channel closed")]
+    OutputChannelClosed,
 }
 
 async fn finish_task<T>(
@@ -367,6 +493,7 @@ mod tests {
     async fn shutdown_flush_queues_a_voice_request() {
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
         let (request_sender, mut request_receiver) = llm_request_channel(0);
+        let (output_sender, mut output_receiver) = mpsc::unbounded_channel();
         event_sender
             .send(DeepgramEvent::Transcript {
                 text: "Что такое HashMap?".to_owned(),
@@ -379,6 +506,7 @@ mod tests {
         let stats = run_transcript_windows(
             event_receiver,
             request_sender,
+            output_sender,
             TranscriptConfig {
                 window_sec: 60,
                 min_utterance_chars: 3,
@@ -395,5 +523,42 @@ mod tests {
         assert_eq!(request.request_id, 0);
         assert_eq!(request.mode, Mode::Voice);
         assert_eq!(request.text, "Что такое HashMap?");
+        assert!(matches!(
+            output_receiver.recv().await,
+            Some(OutputEvent::Transcript(TranscriptView {
+                sequence: 0,
+                text,
+            })) if text == "Что такое HashMap?"
+        ));
+    }
+
+    #[test]
+    fn maps_reconnect_status_and_audio_queue_for_output_sink() {
+        let (output_sender, mut output_receiver) = mpsc::unbounded_channel();
+
+        handle_stt_status(
+            SttStatus::Reconnecting {
+                retry_count: 3,
+                delay_secs: 4,
+                queue_len: 17,
+            },
+            &output_sender,
+        )
+        .expect("status must be forwarded");
+
+        assert!(matches!(
+            output_receiver.try_recv(),
+            Ok(OutputEvent::Status(StatusMessage {
+                kind: StatusKind::Reconnecting,
+                text,
+            })) if text == "Deepgram reconnect in 4s (retry 3)"
+        ));
+        assert_eq!(
+            output_receiver.try_recv(),
+            Ok(OutputEvent::QueueState(QueueState {
+                queue: QueueKind::Audio,
+                len: 17,
+            }))
+        );
     }
 }
