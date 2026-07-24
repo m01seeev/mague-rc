@@ -69,7 +69,9 @@ pub enum StatusKind {
     Started,
     Connecting,
     Listening,
+    Paused,
     Reconnecting,
+    HistoryCleared,
     Stopped,
 }
 
@@ -151,4 +153,12 @@ pub enum OutputEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LlmCommand {
     ClearHistory,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppCommand {
+    PauseListening,
+    ResumeListening,
+    ClearHistory,
+    Shutdown,
 }

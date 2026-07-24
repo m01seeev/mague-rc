@@ -49,9 +49,15 @@ impl AppSnapshot {
                     self.stt_status = ConnectionStatus::Connected;
                     self.last_error = None;
                 }
+                StatusKind::Paused => self.listening = false,
                 StatusKind::Reconnecting => {
                     self.listening = false;
                     self.stt_status = ConnectionStatus::Reconnecting;
+                }
+                StatusKind::HistoryCleared => {
+                    self.current_transcript.clear();
+                    self.current_answer_id = None;
+                    self.current_answer.clear();
                 }
                 StatusKind::Stopped => {
                     self.running = false;

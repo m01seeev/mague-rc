@@ -5,7 +5,6 @@ use crate::{
     audio::AudioError,
     config::ConfigError,
     llm::{LlmError, LlmQueueError, LlmWorkerError},
-    output::TerminalOutputError,
     stt::SttError,
 };
 
@@ -38,8 +37,14 @@ pub enum AppError {
     #[error(transparent)]
     TranscriptWorker(#[from] TranscriptWorkerError),
 
-    #[error(transparent)]
-    TerminalOutput(#[from] TerminalOutputError),
+    #[error("output sink failed: {0}")]
+    Output(String),
+
+    #[error("failed to start overlay: {0}")]
+    Overlay(String),
+
+    #[error("unknown argument `{0}`; expected --overlay or --terminal")]
+    Argument(String),
 
     #[error("{worker} worker task failed: {error}")]
     WorkerTask { worker: &'static str, error: String },

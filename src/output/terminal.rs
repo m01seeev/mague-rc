@@ -8,19 +8,10 @@ use tokio::sync::mpsc;
 
 use crate::{
     events::{OutputComponent, OutputEvent, StatusKind},
-    output::OutputSink,
+    output::{OutputSink, OutputStats},
 };
 
 pub struct TerminalOutputSink;
-
-#[derive(Default)]
-pub struct TerminalOutputStats {
-    pub statuses: u64,
-    pub transcripts: u64,
-    pub started: u64,
-    pub completed: u64,
-    pub failed: u64,
-}
 
 #[derive(Debug, Error)]
 pub enum TerminalOutputError {
@@ -30,12 +21,11 @@ pub enum TerminalOutputError {
 
 impl OutputSink for TerminalOutputSink {
     type Error = TerminalOutputError;
-    type Stats = TerminalOutputStats;
 
     async fn run(
         self,
         mut events: mpsc::UnboundedReceiver<OutputEvent>,
-    ) -> Result<TerminalOutputStats, TerminalOutputError> {
+    ) -> Result<OutputStats, TerminalOutputError> {
         let mut renderer = TerminalRenderer::default();
 
         while let Some(event) = events.recv().await {
@@ -52,7 +42,7 @@ impl OutputSink for TerminalOutputSink {
 struct TerminalRenderer {
     active_answer: Option<u64>,
     pending: VecDeque<OutputEvent>,
-    stats: TerminalOutputStats,
+    stats: OutputStats,
 }
 
 impl TerminalRenderer {
@@ -114,7 +104,9 @@ impl TerminalRenderer {
                     StatusKind::Started => "started",
                     StatusKind::Connecting => "connecting",
                     StatusKind::Listening => "listening",
+                    StatusKind::Paused => "paused",
                     StatusKind::Reconnecting => "reconnecting",
+                    StatusKind::HistoryCleared => "history",
                     StatusKind::Stopped => "stopped",
                 };
                 writeln!(writer, "[{label}] {}", status.text)?;

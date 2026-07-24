@@ -70,6 +70,12 @@ impl TranscriptWindowAssembler {
         Some(self.chunk(text))
     }
 
+    pub fn discard_pending(&mut self) {
+        self.pending_finals.clear();
+        self.current_interim.clear();
+        self.sent_interim.clear();
+    }
+
     fn chunk(&mut self, text: String) -> TranscriptChunk {
         let chunk = TranscriptChunk {
             sequence: self.next_sequence,
@@ -211,6 +217,20 @@ mod tests {
             Some("подтвержденная часть новый незаконченный хвост".to_owned())
         );
         assert_eq!(assembler.finish(), None);
+    }
+
+    #[test]
+    fn discards_pending_text_without_resetting_sequence() {
+        let mut assembler = assembler();
+        assembler.push_transcript("первый вопрос", true);
+        assert_eq!(assembler.flush().map(|chunk| chunk.sequence), Some(0));
+
+        assembler.push_transcript("не должен уйти", true);
+        assembler.discard_pending();
+        assert_eq!(assembler.flush(), None);
+
+        assembler.push_transcript("следующий вопрос", true);
+        assert_eq!(assembler.flush().map(|chunk| chunk.sequence), Some(1));
     }
 
     #[test]

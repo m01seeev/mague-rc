@@ -14,8 +14,8 @@ use crate::{
     control::TerminalEchoGuard,
     error::AppError,
     events::{
-        AppErrorView, DeepgramEvent, LlmCommand, LlmRequest, Mode, OutputComponent, OutputEvent,
-        QueueKind, QueueState, StatusKind, StatusMessage, SttStatus, TranscriptChunk,
+        AppCommand, AppErrorView, DeepgramEvent, LlmCommand, LlmRequest, Mode, OutputComponent,
+        OutputEvent, QueueKind, QueueState, StatusKind, StatusMessage, SttStatus, TranscriptChunk,
         TranscriptView,
     },
     llm::{
@@ -29,6 +29,19 @@ use crate::{
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub async fn run(config: Config) -> Result<(), AppError> {
+    let (_command_sender, command_receiver) = mpsc::unbounded_channel();
+    run_with_sink(config, TerminalOutputSink, command_receiver).await
+}
+
+pub async fn run_with_sink<S>(
+    config: Config,
+    sink: S,
+    mut app_commands: mpsc::UnboundedReceiver<AppCommand>,
+) -> Result<(), AppError>
+where
+    S: OutputSink,
+    S::Error: std::fmt::Display,
+{
     let _terminal_echo_guard = TerminalEchoGuard::hide_control_characters();
 
     info!(
@@ -45,7 +58,8 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     let (stt_event_sender, stt_event_receiver) = mpsc::unbounded_channel();
     let (llm_request_sender, llm_request_receiver) = llm_request_channel(config.llm.queue_max);
     let (output_sender, output_receiver) = mpsc::unbounded_channel::<OutputEvent>();
-    let (_llm_command_sender, llm_command_receiver) = mpsc::unbounded_channel::<LlmCommand>();
+    let (llm_command_sender, llm_command_receiver) = mpsc::unbounded_channel::<LlmCommand>();
+    let (transcript_command_sender, transcript_command_receiver) = mpsc::unbounded_channel();
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
 
     send_output(
@@ -75,6 +89,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         stt_event_receiver,
         llm_request_sender,
         output_sender.clone(),
+        transcript_command_receiver,
         config.transcript,
     ));
     let mut llm_task = tokio::spawn(llm_worker.run(
@@ -82,7 +97,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         llm_command_receiver,
         output_sender.clone(),
     ));
-    let mut output_task = tokio::spawn(TerminalOutputSink.run(output_receiver));
+    let mut output_task = tokio::spawn(sink.run(output_receiver));
 
     let mut audio_completed = None;
     let mut stt_completed = None;
@@ -90,35 +105,99 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     let mut llm_completed = None;
     let mut output_completed = None;
 
-    let stop_reason = tokio::select! {
-        signal = tokio::signal::ctrl_c() => {
-            signal.map_err(AppError::Shutdown)?;
-            info!(
-                module = "app",
-                event = "shutdown_requested",
-                "shutdown signal received"
-            );
-            StopReason::Signal
-        }
-        result = &mut audio_task => {
-            audio_completed = Some(result);
-            StopReason::Audio
-        }
-        result = &mut stt_task => {
-            stt_completed = Some(result);
-            StopReason::Stt
-        }
-        result = &mut transcript_task => {
-            transcript_completed = Some(result);
-            StopReason::Transcript
-        }
-        result = &mut llm_task => {
-            llm_completed = Some(result);
-            StopReason::Llm
-        }
-        result = &mut output_task => {
-            output_completed = Some(result);
-            StopReason::Output
+    let mut app_commands_open = true;
+    let stop_reason = loop {
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => {
+                signal.map_err(AppError::Shutdown)?;
+                info!(
+                    module = "app",
+                    event = "shutdown_requested",
+                    "shutdown signal received"
+                );
+                break StopReason::Signal;
+            }
+            command = app_commands.recv(), if app_commands_open => {
+                match command {
+                    Some(AppCommand::PauseListening) => {
+                        if transcript_command_sender
+                            .send(TranscriptCommand::SetPaused(true))
+                            .is_err()
+                        {
+                            break StopReason::Transcript;
+                        }
+                        if output_sender
+                            .send(OutputEvent::Status(StatusMessage {
+                                kind: StatusKind::Paused,
+                                text: "listening paused".to_owned(),
+                            }))
+                            .is_err()
+                        {
+                            break StopReason::Output;
+                        }
+                    }
+                    Some(AppCommand::ResumeListening) => {
+                        if transcript_command_sender
+                            .send(TranscriptCommand::SetPaused(false))
+                            .is_err()
+                        {
+                            break StopReason::Transcript;
+                        }
+                        if output_sender
+                            .send(OutputEvent::Status(StatusMessage {
+                                kind: StatusKind::Listening,
+                                text: "listening resumed".to_owned(),
+                            }))
+                            .is_err()
+                        {
+                            break StopReason::Output;
+                        }
+                    }
+                    Some(AppCommand::ClearHistory) => {
+                        if llm_command_sender.send(LlmCommand::ClearHistory).is_err() {
+                            break StopReason::Llm;
+                        }
+                        if output_sender
+                            .send(OutputEvent::Status(StatusMessage {
+                                kind: StatusKind::HistoryCleared,
+                                text: "conversation history cleared".to_owned(),
+                            }))
+                            .is_err()
+                        {
+                            break StopReason::Output;
+                        }
+                    }
+                    Some(AppCommand::Shutdown) => {
+                        info!(
+                            module = "app",
+                            event = "shutdown_requested",
+                            "shutdown command received"
+                        );
+                        break StopReason::Command;
+                    }
+                    None => app_commands_open = false,
+                }
+            }
+            result = &mut audio_task => {
+                audio_completed = Some(result);
+                break StopReason::Audio;
+            }
+            result = &mut stt_task => {
+                stt_completed = Some(result);
+                break StopReason::Stt;
+            }
+            result = &mut transcript_task => {
+                transcript_completed = Some(result);
+                break StopReason::Transcript;
+            }
+            result = &mut llm_task => {
+                llm_completed = Some(result);
+                break StopReason::Llm;
+            }
+            result = &mut output_task => {
+                output_completed = Some(result);
+                break StopReason::Output;
+            }
         }
     };
 
@@ -138,7 +217,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     if output_sender
         .send(OutputEvent::Status(StatusMessage {
             kind: StatusKind::Stopped,
-            text: "mague-rc stopped cleanly".to_owned(),
+            text: "mague-rc pipeline stopped".to_owned(),
         }))
         .is_err()
     {
@@ -149,13 +228,13 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         );
     }
     drop(output_sender);
-    let output_stats = finish_task("terminal output", &mut output_task, output_completed).await?;
+    let output_stats = finish_task("output", &mut output_task, output_completed).await?;
 
     flatten_audio_task(audio_result)?;
     flatten_stt_task(stt_result)?;
     let transcript_stats = transcript_stats.map_err(AppError::TranscriptWorker)?;
     let llm_stats = llm_stats.map_err(AppError::LlmWorker)?;
-    let output_stats = output_stats.map_err(AppError::TerminalOutput)?;
+    let output_stats = output_stats.map_err(|error| AppError::Output(error.to_string()))?;
 
     if let Some(worker) = stop_reason.unexpected_worker() {
         return Err(AppError::WorkerStopped(worker));
@@ -179,6 +258,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
 #[derive(Clone, Copy)]
 enum StopReason {
     Signal,
+    Command,
     Audio,
     Stt,
     Transcript,
@@ -189,12 +269,12 @@ enum StopReason {
 impl StopReason {
     fn unexpected_worker(self) -> Option<&'static str> {
         match self {
-            Self::Signal => None,
+            Self::Signal | Self::Command => None,
             Self::Audio => Some("audio"),
             Self::Stt => Some("stt"),
             Self::Transcript => Some("transcript"),
             Self::Llm => Some("LLM"),
-            Self::Output => Some("terminal output"),
+            Self::Output => Some("output"),
         }
     }
 }
@@ -206,10 +286,16 @@ struct TranscriptStats {
     chunks: u64,
 }
 
+#[derive(Clone, Copy)]
+enum TranscriptCommand {
+    SetPaused(bool),
+}
+
 async fn run_transcript_windows(
     mut events: mpsc::UnboundedReceiver<DeepgramEvent>,
     llm_requests: LlmRequestSender,
     output: mpsc::UnboundedSender<OutputEvent>,
+    mut commands: mpsc::UnboundedReceiver<TranscriptCommand>,
     config: TranscriptConfig,
 ) -> Result<TranscriptStats, TranscriptWorkerError> {
     let mut stats = TranscriptStats::default();
@@ -217,10 +303,24 @@ async fn run_transcript_windows(
     let mut ticker = interval_at(Instant::now() + window_duration, window_duration);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut assembler = TranscriptWindowAssembler::new(config.min_utterance_chars);
+    let mut paused = false;
+    let mut commands_open = true;
 
     loop {
         tokio::select! {
-            _ = ticker.tick() => {
+            biased;
+            command = commands.recv(), if commands_open => {
+                match command {
+                    Some(TranscriptCommand::SetPaused(next_paused)) => {
+                        paused = next_paused;
+                        if paused {
+                            assembler.discard_pending();
+                        }
+                    }
+                    None => commands_open = false,
+                }
+            }
+            _ = ticker.tick(), if !paused => {
                 flush_transcript_window(
                     &mut assembler,
                     &llm_requests,
@@ -231,6 +331,7 @@ async fn run_transcript_windows(
                 .await?;
             }
             event = events.recv() => match event {
+                Some(DeepgramEvent::Transcript { .. }) if paused => {}
                 Some(event) => handle_deepgram_event(event, &mut assembler, &output, &mut stats)?,
                 None => break,
             }
@@ -494,6 +595,7 @@ mod tests {
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
         let (request_sender, mut request_receiver) = llm_request_channel(0);
         let (output_sender, mut output_receiver) = mpsc::unbounded_channel();
+        let (_command_sender, command_receiver) = mpsc::unbounded_channel();
         event_sender
             .send(DeepgramEvent::Transcript {
                 text: "Что такое HashMap?".to_owned(),
@@ -507,6 +609,7 @@ mod tests {
             event_receiver,
             request_sender,
             output_sender,
+            command_receiver,
             TranscriptConfig {
                 window_sec: 60,
                 min_utterance_chars: 3,

@@ -33,3 +33,10 @@ tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
     "rustls-tls-native-roots",
 ] }
 url = "2.5.4"
+iced_layershell = "0.19.1"
+iced = { version = "0.14.0", default-features = false, features = [
+    "tiny-skia",
+    "tokio",
+    "wayland",
+] }
+lucide-icons = { version = "1.25.0", features = ["iced"] }
