@@ -19,6 +19,16 @@ On Arch Linux:
 sudo pacman -S --needed gtk4 gtk4-layer-shell
 ```
 
+### Hyprland screen-share exclusion
+
+The overlay works with the standard Hyprland package, but standard Hyprland cannot hide it from a monitor or region screen share without leaving a black rectangle. For seamless presenter mode, use [`hyprland-presenter`](https://aur.archlinux.org/packages/hyprland-presenter) in place of the standard Hyprland package:
+
+```bash
+yay -S hyprland-presenter
+```
+
+This patched Hyprland build supports omitting the `mague-rc-overlay` layer from screen-share output while keeping it visible on the local monitor. The content behind the overlay remains visible in the shared image instead of being replaced with a black placeholder. Restart the Hyprland session after replacing the compositor package.
+
 ## Configuration
 
 Create a local environment file and fill in the provider keys:
@@ -126,4 +136,4 @@ cargo test
 
 Implemented: typed configuration, redacted secrets, continuous PCM capture through `ffmpeg`, bounded/unbounded queues with backpressure, authenticated Deepgram WebSocket streaming, keepalive, final/interim event parsing, ordered reconnect with retry, fixed transcript windows with interim deduplication and shutdown flush, sequential OpenRouter streaming, timeout handling, four-pair voice history, unified output events, terminal output without interleaved streaming responses, a Hyprland-compatible layer-shell overlay, streaming UI updates, pipeline controls, structured diagnostics, and graceful shutdown.
 
-Not implemented: RAG, OCR, screenshot flow, and capture exclusion for presenter mode. These are introduced only in their corresponding later stages.
+Not implemented: RAG, OCR, and screenshot flow. Seamless presenter-mode capture exclusion is available externally through the patched `hyprland-presenter` package described above; `mague-rc` itself does not modify the compositor.
