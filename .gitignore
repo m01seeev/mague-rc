@@ -1,5 +1,5 @@
 /target/
 .env
 *.log
-/benchmark.wav
+/benchmark*.wav
 /telemetry/
