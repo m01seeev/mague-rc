@@ -28,7 +28,7 @@ use crate::{
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const BENCHMARK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(300);
-const BENCHMARK_EOF_DRAIN: Duration = Duration::from_millis(750);
+const BENCHMARK_EOF_DRAIN: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug, Default)]
 pub struct RunOptions {
@@ -394,6 +394,7 @@ async fn run_transcript_windows(
     tokio::pin!(fallback);
     let mut fallback_armed = false;
     let mut assembler = TranscriptWindowAssembler::new(config.min_utterance_chars);
+    let mut pending_last_word_end_ms = None;
     let mut paused = false;
     let mut commands_open = true;
 
@@ -406,6 +407,7 @@ async fn run_transcript_windows(
                         paused = next_paused;
                         if paused {
                             assembler.discard_pending();
+                            pending_last_word_end_ms = None;
                             fallback_armed = false;
                             send_transcript_draft(&assembler, &output)?;
                         }
@@ -422,6 +424,7 @@ async fn run_transcript_windows(
                     "inactivity_timeout",
                 )
                 .await?;
+                pending_last_word_end_ms = None;
                 fallback_armed = false;
             }
             event = events.recv() => match event {
@@ -432,7 +435,13 @@ async fn run_transcript_windows(
                         DeepgramEvent::Transcript { text, .. } if !text.is_empty()
                     );
                     let flush_reason =
-                        handle_deepgram_event(event, &mut assembler, &output, &mut stats)?;
+                        handle_deepgram_event(
+                            event,
+                            &mut assembler,
+                            &mut pending_last_word_end_ms,
+                            &output,
+                            &mut stats,
+                        )?;
 
                     if has_transcript {
                         fallback
@@ -449,6 +458,7 @@ async fn run_transcript_windows(
                             reason,
                         )
                         .await?;
+                        pending_last_word_end_ms = None;
                         fallback_armed = false;
                     }
                 }
@@ -464,6 +474,7 @@ async fn run_transcript_windows(
 fn handle_deepgram_event(
     event: DeepgramEvent,
     assembler: &mut TranscriptWindowAssembler,
+    pending_last_word_end_ms: &mut Option<u64>,
     output: &mpsc::UnboundedSender<OutputEvent>,
     stats: &mut TranscriptStats,
 ) -> Result<Option<&'static str>, TranscriptWorkerError> {
@@ -508,6 +519,9 @@ fn handle_deepgram_event(
                 );
             }
             assembler.push_transcript(&text, is_final);
+            if let Some(last_word_end_ms) = last_word_end_ms {
+                *pending_last_word_end_ms = Some(last_word_end_ms);
+            }
             send_transcript_draft(assembler, output)?;
             if is_final && speech_final {
                 flush_reason = Some("speech_final");
@@ -526,16 +540,32 @@ fn handle_deepgram_event(
             );
         }
         DeepgramEvent::UtteranceEnd { last_word_end_ms } => {
+            let ignored = last_word_end_ms.zip(*pending_last_word_end_ms).is_some_and(
+                |(utterance_end_ms, pending_word_end_ms)| utterance_end_ms < pending_word_end_ms,
+            );
             send_output(
                 output,
-                OutputEvent::SttObservation(SttObservation::UtteranceEnd { last_word_end_ms }),
+                OutputEvent::SttObservation(SttObservation::UtteranceEnd {
+                    last_word_end_ms,
+                    ignored,
+                }),
             )?;
-            debug!(
-                module = "stt",
-                event = "utterance_end",
-                "Deepgram detected utterance end"
-            );
-            flush_reason = Some("utterance_end");
+            if ignored {
+                debug!(
+                    module = "stt",
+                    event = "stale_utterance_end",
+                    ?last_word_end_ms,
+                    ?pending_last_word_end_ms,
+                    "ignored utterance end for earlier speech"
+                );
+            } else {
+                debug!(
+                    module = "stt",
+                    event = "utterance_end",
+                    "Deepgram detected utterance end"
+                );
+                flush_reason = Some("utterance_end");
+            }
         }
         DeepgramEvent::Metadata => debug!(
             module = "stt",
@@ -970,10 +1000,83 @@ mod tests {
         assert_eq!(stats.chunks, 1);
     }
 
+    #[tokio::test]
+    async fn stale_utterance_end_does_not_flush_new_speech() {
+        let (event_sender, event_receiver) = mpsc::unbounded_channel();
+        let (request_sender, mut request_receiver) = llm_request_channel(0);
+        let (output_sender, mut output_receiver) = mpsc::unbounded_channel();
+        let (_command_sender, command_receiver) = mpsc::unbounded_channel();
+
+        event_sender
+            .send(DeepgramEvent::Transcript {
+                text: "И еще короткий".to_owned(),
+                is_final: false,
+                speech_final: false,
+                audio_start_ms: Some(3_200),
+                audio_duration_ms: Some(300),
+                last_word_end_ms: Some(3_450),
+            })
+            .expect("new speech transcript must send");
+        event_sender
+            .send(DeepgramEvent::UtteranceEnd {
+                last_word_end_ms: Some(3_100),
+            })
+            .expect("stale utterance end must send");
+        event_sender
+            .send(DeepgramEvent::Transcript {
+                text: "И еще короткий вопрос".to_owned(),
+                is_final: true,
+                speech_final: true,
+                audio_start_ms: Some(3_200),
+                audio_duration_ms: Some(800),
+                last_word_end_ms: Some(3_950),
+            })
+            .expect("final transcript must send");
+        drop(event_sender);
+
+        let stats = run_transcript_windows(
+            event_receiver,
+            request_sender,
+            output_sender,
+            command_receiver,
+            TranscriptConfig {
+                window_sec: 60,
+                min_utterance_chars: 3,
+            },
+            None,
+        )
+        .await
+        .expect("transcript worker must stop cleanly");
+
+        assert_eq!(stats.chunks, 1);
+        assert_eq!(
+            request_receiver
+                .recv()
+                .await
+                .expect("speech final must queue one request")
+                .text,
+            "И еще короткий вопрос"
+        );
+        assert_eq!(request_receiver.recv().await, None);
+
+        let mut ignored_stale_boundary = false;
+        while let Ok(event) = output_receiver.try_recv() {
+            ignored_stale_boundary |= matches!(
+                event,
+                OutputEvent::SttObservation(SttObservation::UtteranceEnd {
+                    last_word_end_ms: Some(3_100),
+                    ignored: true,
+                })
+            );
+        }
+        assert!(ignored_stale_boundary);
+    }
+
     #[test]
     fn forwards_growing_interim_text_as_a_draft() {
         let (output_sender, mut output_receiver) = mpsc::unbounded_channel();
         let mut assembler = TranscriptWindowAssembler::new(3);
+        let mut pending_last_word_end_ms = None;
         let mut stats = TranscriptStats::default();
 
         handle_deepgram_event(
@@ -986,6 +1089,7 @@ mod tests {
                 last_word_end_ms: None,
             },
             &mut assembler,
+            &mut pending_last_word_end_ms,
             &output_sender,
             &mut stats,
         )
@@ -1000,6 +1104,7 @@ mod tests {
                 last_word_end_ms: None,
             },
             &mut assembler,
+            &mut pending_last_word_end_ms,
             &output_sender,
             &mut stats,
         )

@@ -423,7 +423,10 @@ impl TelemetryRecorder {
                     }),
                 )
             }
-            SttObservation::UtteranceEnd { last_word_end_ms } => {
+            SttObservation::UtteranceEnd {
+                last_word_end_ms,
+                ignored,
+            } => {
                 let delivery_lag_ms = self.delivery_lag_ms(elapsed_ms, *last_word_end_ms);
                 if let Some(delivery_lag_ms) = delivery_lag_ms {
                     self.stt_latency
@@ -431,24 +434,29 @@ impl TelemetryRecorder {
                         .push(delivery_lag_ms);
                 }
                 self.stt.utterance_end += 1;
-                if self.draft_active {
-                    self.last_utterance_end_ms = Some(elapsed_ms);
+                if *ignored {
+                    self.stt.ignored_utterance_end += 1;
+                } else {
+                    if self.draft_active {
+                        self.last_utterance_end_ms = Some(elapsed_ms);
+                    }
+                    if let Some(last_word_end_ms) = last_word_end_ms {
+                        self.last_word_end_audio_ms = Some(*last_word_end_ms);
+                    }
+                    if let Some(index) = self.active_utterance.take() {
+                        self.utterances[index].utterance_end_ms = Some(elapsed_ms);
+                    }
+                    finish_recognition_segment(
+                        &mut self.pending_recognition,
+                        &mut self.recognition_segments,
+                    );
                 }
-                if let Some(last_word_end_ms) = last_word_end_ms {
-                    self.last_word_end_audio_ms = Some(*last_word_end_ms);
-                }
-                if let Some(index) = self.active_utterance.take() {
-                    self.utterances[index].utterance_end_ms = Some(elapsed_ms);
-                }
-                finish_recognition_segment(
-                    &mut self.pending_recognition,
-                    &mut self.recognition_segments,
-                );
                 (
                     "utterance_end",
                     json!({
                         "last_word_end_ms": last_word_end_ms,
                         "delivery_lag_ms": delivery_lag_ms,
+                        "ignored": ignored,
                     }),
                 )
             }
@@ -764,6 +772,7 @@ struct SttMetrics {
     speech_final_transcripts: u64,
     speech_started: u64,
     utterance_end: u64,
+    ignored_utterance_end: u64,
 }
 
 #[derive(Serialize)]
@@ -1279,6 +1288,7 @@ mod tests {
         recorder
             .record(&OutputEvent::SttObservation(SttObservation::UtteranceEnd {
                 last_word_end_ms: Some(1_000),
+                ignored: false,
             }))
             .expect("utterance end must be recorded");
         recorder
