@@ -291,6 +291,7 @@ enum SendOutcome {
     Shutdown,
     Cancelled,
     AudioChannelClosed,
+    EventChannelClosed,
     ConnectionError(String),
 }
 
@@ -322,6 +323,7 @@ async fn run_connection(
         writer,
         audio,
         retry_frame,
+        events.clone(),
         command_receiver,
         cancel_receiver.clone(),
     ));
@@ -398,11 +400,20 @@ async fn send_audio(
     mut writer: DeepgramWriter,
     mut audio: AudioFrameReceiver,
     retry_frame: Option<AudioFrame>,
+    events: mpsc::UnboundedSender<DeepgramEvent>,
     mut commands: mpsc::Receiver<WriterCommand>,
     mut cancel: watch::Receiver<bool>,
 ) -> SendTaskResult {
+    let mut audio_started = false;
     if let Some(frame) = retry_frame
-        && let Err(outcome) = send_frame(&mut writer, &frame, &mut cancel).await
+        && let Err(outcome) = send_frame_and_mark_started(
+            &mut writer,
+            &frame,
+            &events,
+            &mut audio_started,
+            &mut cancel,
+        )
+        .await
     {
         return SendTaskResult {
             audio,
@@ -464,7 +475,16 @@ async fn send_audio(
                         outcome: SendOutcome::AudioChannelClosed,
                     };
                 };
-                if let Err(outcome) = send_frame(&mut writer, &frame, &mut cancel).await {
+                if let Err(outcome) =
+                    send_frame_and_mark_started(
+                        &mut writer,
+                        &frame,
+                        &events,
+                        &mut audio_started,
+                        &mut cancel,
+                    )
+                    .await
+                {
                     return SendTaskResult {
                         audio,
                         retry_frame: Some(frame),
@@ -474,6 +494,23 @@ async fn send_audio(
             }
         }
     }
+}
+
+async fn send_frame_and_mark_started(
+    writer: &mut DeepgramWriter,
+    frame: &AudioFrame,
+    events: &mpsc::UnboundedSender<DeepgramEvent>,
+    audio_started: &mut bool,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<(), SendOutcome> {
+    send_frame(writer, frame, cancel).await?;
+    if !*audio_started {
+        events
+            .send(DeepgramEvent::AudioStreamStarted)
+            .map_err(|_| SendOutcome::EventChannelClosed)?;
+        *audio_started = true;
+    }
+    Ok(())
 }
 
 async fn send_frame(
@@ -588,6 +625,7 @@ fn connection_outcome(send: &SendOutcome, read: ReadOutcome) -> ConnectionOutcom
     match send {
         SendOutcome::Shutdown => ConnectionOutcome::Shutdown,
         SendOutcome::AudioChannelClosed => ConnectionOutcome::AudioChannelClosed,
+        SendOutcome::EventChannelClosed => ConnectionOutcome::EventChannelClosed,
         SendOutcome::ConnectionError(error) => ConnectionOutcome::Disconnected(error.clone()),
         SendOutcome::Cancelled => match read {
             ReadOutcome::EventChannelClosed => ConnectionOutcome::EventChannelClosed,
@@ -888,16 +926,23 @@ mod tests {
             .await
             .expect("third frame must queue");
 
-        let transcript = timeout(Duration::from_secs(4), async {
+        let (transcript, audio_stream_starts) = timeout(Duration::from_secs(4), async {
+            let mut audio_stream_starts = 0;
             loop {
-                if let Some(DeepgramEvent::Transcript { text, .. }) = event_receiver.recv().await {
-                    break text;
+                match event_receiver.recv().await {
+                    Some(DeepgramEvent::AudioStreamStarted) => audio_stream_starts += 1,
+                    Some(DeepgramEvent::Transcript { text, .. }) => {
+                        break (text, audio_stream_starts);
+                    }
+                    Some(_) => {}
+                    None => panic!("event stream closed before transcript"),
                 }
             }
         })
         .await
         .expect("transcript must arrive after reconnect");
         assert_eq!(transcript, "проверка связи");
+        assert_eq!(audio_stream_starts, 2);
 
         shutdown_sender
             .send(true)

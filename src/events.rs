@@ -9,6 +9,7 @@ pub struct AudioFrame {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeepgramEvent {
     Status(SttStatus),
+    AudioStreamStarted,
     Transcript {
         text: String,
         is_final: bool,
@@ -97,6 +98,7 @@ pub struct TranscriptView {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SttObservation {
+    AudioStreamStarted,
     Transcript {
         text: String,
         is_final: bool,

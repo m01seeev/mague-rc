@@ -481,6 +481,12 @@ fn handle_deepgram_event(
     let mut flush_reason = None;
     match event {
         DeepgramEvent::Status(status) => handle_stt_status(status, output)?,
+        DeepgramEvent::AudioStreamStarted => {
+            send_output(
+                output,
+                OutputEvent::SttObservation(SttObservation::AudioStreamStarted),
+            )?;
+        }
         DeepgramEvent::Transcript {
             text,
             is_final,

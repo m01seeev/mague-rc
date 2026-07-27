@@ -14,7 +14,7 @@ use tokio::{sync::mpsc, task::JoinError};
 
 use crate::{
     config::Config,
-    events::{LlmUsage, OutputComponent, OutputEvent, StatusKind, SttObservation},
+    events::{LlmUsage, OutputComponent, OutputEvent, SttObservation},
     output::{OutputSink, OutputStats},
 };
 
@@ -195,16 +195,11 @@ impl TelemetryRecorder {
     fn record(&mut self, event: &OutputEvent) -> Result<(), TelemetryError> {
         let elapsed_ms = self.elapsed_ms();
         let (name, request_id, fields) = match event {
-            OutputEvent::Status(status) => {
-                if status.kind == StatusKind::Listening && self.audio_stream_started_ms.is_none() {
-                    self.audio_stream_started_ms = Some(elapsed_ms);
-                }
-                (
-                    "status",
-                    None,
-                    json!({"kind": format!("{:?}", status.kind), "text": status.text}),
-                )
-            }
+            OutputEvent::Status(status) => (
+                "status",
+                None,
+                json!({"kind": format!("{:?}", status.kind), "text": status.text}),
+            ),
             OutputEvent::SttObservation(observation) => {
                 return self.record_stt(elapsed_ms, observation);
             }
@@ -320,6 +315,10 @@ impl TelemetryRecorder {
         observation: &SttObservation,
     ) -> Result<(), TelemetryError> {
         let (name, fields) = match observation {
+            SttObservation::AudioStreamStarted => {
+                self.audio_stream_started_ms = Some(elapsed_ms);
+                ("audio_stream_started", json!({}))
+            }
             SttObservation::Transcript {
                 text,
                 is_final,
