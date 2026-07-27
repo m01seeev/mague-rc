@@ -171,7 +171,7 @@ impl Config {
                 utterance_end_ms: reader.parse("DEEPGRAM_UTTERANCE_END_MS", 1_200)?,
                 keyterms: reader.list(
                     "DEEPGRAM_KEYTERMS",
-                    "Java,Spring Boot,PostgreSQL,Kafka,Redis,Docker,Kubernetes",
+                    "Java,Spring Boot,PostgreSQL,Kafka,Kafka consumer,offset,Redis,Docker,Kubernetes,HashMap,ConcurrentHashMap,hashCode,equals,optimistic locking,pessimistic locking,идемпотентность",
                 ),
             },
             llm: LlmConfig {

@@ -84,7 +84,7 @@ Each run writes two ignored artifacts under `telemetry/`:
 - `*.events.jsonl` is the chronological event stream with monotonic timestamps and raw STT/LLM events.
 - `*.summary.json` contains run metadata, audio/reference hashes, effective non-secret configuration, Git branch/commit/dirty state, recognized utterances, submitted questions, complete answers, token usage, cost, and aggregate latency distributions.
 
-The request summary separates question construction, queue wait, LLM time to first token, generation time, and speech-end-to-first-token latency. The STT summary reports approximate delivery lag for interim/final transcripts, speech-start events, and utterance-end events from Deepgram's audio positions; the raw receive and audio timestamps remain in JSONL for inspection. These provider timestamps are useful for comparisons but are not guaranteed to be millisecond-precise. With a reference file the summary also reports normalized word error rate (`WER`) and character error rate (`CER`) globally and per line.
+The request summary separates question construction, queue wait, LLM time to first token, generation time, speech-boundary-to-first-token latency, and full last-word-to-first-token latency. The latter uses Deepgram's final word timestamp and therefore includes endpointing, STT delivery, queueing, and LLM TTFT. The STT summary reports approximate delivery lag for interim/final transcripts, speech-start events, and utterance-end events from Deepgram's audio positions; the raw receive and audio timestamps remain in JSONL for inspection. These provider timestamps are useful for comparisons but are not guaranteed to be millisecond-precise. With a reference file the summary also reports normalized word error rate (`WER`) and character error rate (`CER`) globally and per line.
 
 Use the same base commit and audio hash when comparing implementations. Keep the benchmark harness on the base branch, create one branch per strategy, and run each strategy several times because provider/network latency varies:
 
@@ -162,7 +162,7 @@ Keep values containing spaces in double quotes, for example:
 
 ```env
 CURRENT_PROJECT="АО Консалт Плюс"
-DEEPGRAM_KEYTERMS="Java,Spring Boot,PostgreSQL,Kafka,Redis,Docker,Kubernetes"
+DEEPGRAM_KEYTERMS="Java,Spring Boot,PostgreSQL,Kafka,Kafka consumer,offset,Redis,Docker,Kubernetes,HashMap,ConcurrentHashMap,hashCode,equals,optimistic locking,pessimistic locking,идемпотентность"
 ```
 
 Never add spaces around `=`. Use `RUST_LOG=debug cargo run` only when detailed interim transcripts and protocol diagnostics are needed.

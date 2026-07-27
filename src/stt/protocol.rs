@@ -34,6 +34,13 @@ struct Channel {
 struct Alternative {
     #[serde(default)]
     transcript: String,
+    #[serde(default)]
+    words: Vec<Word>,
+}
+
+#[derive(Deserialize)]
+struct Word {
+    end: Option<f64>,
 }
 
 pub fn parse_server_message(message: &str) -> Result<Option<DeepgramEvent>, ProtocolError> {
@@ -46,19 +53,27 @@ pub fn parse_server_message(message: &str) -> Result<Option<DeepgramEvent>, Prot
     match message_type {
         "Results" => {
             let result: ResultsMessage = serde_json::from_value(value)?;
-            let text = result
-                .channel
-                .alternatives
-                .into_iter()
-                .next()
+            let alternative = result.channel.alternatives.into_iter().next();
+            let text = alternative
+                .as_ref()
                 .map(|alternative| alternative.transcript.trim().to_owned())
                 .unwrap_or_default();
+            let last_word_end_ms = alternative
+                .and_then(|alternative| {
+                    alternative
+                        .words
+                        .into_iter()
+                        .rev()
+                        .find_map(|word| word.end)
+                })
+                .and_then(seconds_to_ms);
             Ok(Some(DeepgramEvent::Transcript {
                 text,
                 is_final: result.is_final,
                 speech_final: result.speech_final,
                 audio_start_ms: result.start.and_then(seconds_to_ms),
                 audio_duration_ms: result.duration.and_then(seconds_to_ms),
+                last_word_end_ms,
             }))
         }
         "SpeechStarted" => Ok(Some(DeepgramEvent::SpeechStarted {
@@ -128,6 +143,7 @@ mod tests {
                 speech_final: false,
                 audio_start_ms: None,
                 audio_duration_ms: None,
+                last_word_end_ms: None,
             }
         );
     }
@@ -161,7 +177,15 @@ mod tests {
                 "type": "Results",
                 "start": 1.25,
                 "duration": 0.75,
-                "channel": {"alternatives": [{"transcript": "test"}]}
+                "channel": {
+                    "alternatives": [{
+                        "transcript": "test",
+                        "words": [
+                            {"word": "a", "start": 1.25, "end": 1.5},
+                            {"word": "test", "start": 1.6, "end": 1.9}
+                        ]
+                    }]
+                }
             }"#,
         )
         .expect("message must parse")
@@ -172,6 +196,7 @@ mod tests {
             DeepgramEvent::Transcript {
                 audio_start_ms: Some(1_250),
                 audio_duration_ms: Some(750),
+                last_word_end_ms: Some(1_900),
                 ..
             }
         ));

@@ -476,6 +476,7 @@ fn handle_deepgram_event(
             speech_final,
             audio_start_ms,
             audio_duration_ms,
+            last_word_end_ms,
         } if !text.is_empty() => {
             stats.transcripts += 1;
             send_output(
@@ -486,6 +487,7 @@ fn handle_deepgram_event(
                     speech_final,
                     audio_start_ms,
                     audio_duration_ms,
+                    last_word_end_ms,
                 }),
             )?;
             if is_final {
@@ -796,6 +798,7 @@ mod tests {
                 speech_final: true,
                 audio_start_ms: Some(100),
                 audio_duration_ms: Some(900),
+                last_word_end_ms: Some(900),
             })
             .expect("STT event must send");
         drop(event_sender);
@@ -830,6 +833,7 @@ mod tests {
                 speech_final: true,
                 audio_start_ms: Some(100),
                 audio_duration_ms: Some(900),
+                last_word_end_ms: Some(900),
             })) if text == "Что такое HashMap?"
         ));
         assert!(matches!(
@@ -860,6 +864,7 @@ mod tests {
                 speech_final: false,
                 audio_start_ms: None,
                 audio_duration_ms: None,
+                last_word_end_ms: None,
             })
             .expect("first final transcript must send");
         event_sender
@@ -869,6 +874,7 @@ mod tests {
                 speech_final: false,
                 audio_start_ms: None,
                 audio_duration_ms: None,
+                last_word_end_ms: None,
             })
             .expect("second final transcript must send");
         event_sender
@@ -934,6 +940,7 @@ mod tests {
                 speech_final: false,
                 audio_start_ms: None,
                 audio_duration_ms: None,
+                last_word_end_ms: None,
             })
             .expect("interim transcript must send");
 
@@ -976,6 +983,7 @@ mod tests {
                 speech_final: false,
                 audio_start_ms: None,
                 audio_duration_ms: None,
+                last_word_end_ms: None,
             },
             &mut assembler,
             &output_sender,
@@ -989,6 +997,7 @@ mod tests {
                 speech_final: false,
                 audio_start_ms: None,
                 audio_duration_ms: None,
+                last_word_end_ms: None,
             },
             &mut assembler,
             &output_sender,
@@ -1004,6 +1013,7 @@ mod tests {
                 speech_final: false,
                 audio_start_ms: None,
                 audio_duration_ms: None,
+                last_word_end_ms: None,
             }))
         );
         assert_eq!(
@@ -1020,6 +1030,7 @@ mod tests {
                 speech_final: false,
                 audio_start_ms: None,
                 audio_duration_ms: None,
+                last_word_end_ms: None,
             }))
         );
         assert_eq!(

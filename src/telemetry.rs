@@ -18,7 +18,7 @@ use crate::{
     output::{OutputSink, OutputStats},
 };
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Error)]
 pub enum TelemetryError {
@@ -111,6 +111,7 @@ struct TelemetryRecorder {
     last_final_ms: Option<u64>,
     last_speech_final_ms: Option<u64>,
     last_utterance_end_ms: Option<u64>,
+    last_word_end_audio_ms: Option<u64>,
     stt: SttMetrics,
     stt_latency: SttLatencyMetrics,
 }
@@ -182,6 +183,7 @@ impl TelemetryRecorder {
             last_final_ms: None,
             last_speech_final_ms: None,
             last_utterance_end_ms: None,
+            last_word_end_audio_ms: None,
             stt: SttMetrics::default(),
             stt_latency: SttLatencyMetrics::default(),
         };
@@ -228,6 +230,10 @@ impl TelemetryRecorder {
                 metrics.last_final_ms = self.last_final_ms.take();
                 metrics.speech_final_ms = self.last_speech_final_ms.take();
                 metrics.utterance_end_ms = self.last_utterance_end_ms.take();
+                metrics.last_word_end_audio_ms = self.last_word_end_audio_ms.take();
+                metrics.last_word_end_elapsed_ms = metrics
+                    .last_word_end_audio_ms
+                    .and_then(|audio_ms| self.audio_stream_started_ms?.checked_add(audio_ms));
                 self.draft_active = false;
                 (
                     "question_queued",
@@ -320,6 +326,7 @@ impl TelemetryRecorder {
                 speech_final,
                 audio_start_ms,
                 audio_duration_ms,
+                last_word_end_ms,
             } => {
                 let audio_end_ms = (*audio_start_ms)
                     .zip(*audio_duration_ms)
@@ -349,6 +356,9 @@ impl TelemetryRecorder {
                     if let Some(delivery_lag_ms) = delivery_lag_ms {
                         self.stt_latency.final_delivery_lag_ms.push(delivery_lag_ms);
                     }
+                    if let Some(last_word_end_ms) = last_word_end_ms {
+                        self.last_word_end_audio_ms = Some(*last_word_end_ms);
+                    }
                 } else {
                     self.stt.interim_transcripts += 1;
                     utterance.first_interim_ms.get_or_insert(elapsed_ms);
@@ -377,6 +387,7 @@ impl TelemetryRecorder {
                         "audio_start_ms": audio_start_ms,
                         "audio_duration_ms": audio_duration_ms,
                         "audio_end_ms": audio_end_ms,
+                        "last_word_end_ms": last_word_end_ms,
                         "delivery_lag_ms": delivery_lag_ms,
                     }),
                 )
@@ -423,6 +434,9 @@ impl TelemetryRecorder {
                 if self.draft_active {
                     self.last_utterance_end_ms = Some(elapsed_ms);
                 }
+                if let Some(last_word_end_ms) = last_word_end_ms {
+                    self.last_word_end_audio_ms = Some(*last_word_end_ms);
+                }
                 if let Some(index) = self.active_utterance.take() {
                     self.utterances[index].utterance_end_ms = Some(elapsed_ms);
                 }
@@ -448,6 +462,7 @@ impl TelemetryRecorder {
         self.last_final_ms = None;
         self.last_speech_final_ms = None;
         self.last_utterance_end_ms = None;
+        self.last_word_end_audio_ms = None;
     }
 
     fn delivery_lag_ms(&self, elapsed_ms: u64, audio_position_ms: Option<u64>) -> Option<u64> {
@@ -633,6 +648,8 @@ struct RequestMetrics {
     last_final_ms: Option<u64>,
     speech_final_ms: Option<u64>,
     utterance_end_ms: Option<u64>,
+    last_word_end_audio_ms: Option<u64>,
+    last_word_end_elapsed_ms: Option<u64>,
     question_queued_ms: Option<u64>,
     llm_started_ms: Option<u64>,
     first_token_ms: Option<u64>,
@@ -655,6 +672,8 @@ struct RequestSummary {
     last_final_ms: Option<u64>,
     speech_final_ms: Option<u64>,
     utterance_end_ms: Option<u64>,
+    last_word_end_audio_ms: Option<u64>,
+    last_word_end_elapsed_ms: Option<u64>,
     question_queued_ms: Option<u64>,
     llm_started_ms: Option<u64>,
     first_token_ms: Option<u64>,
@@ -667,7 +686,8 @@ struct RequestSummary {
     queue_wait_ms: Option<u64>,
     ttft_ms: Option<u64>,
     queued_to_first_token_ms: Option<u64>,
-    speech_end_to_first_token_ms: Option<u64>,
+    speech_boundary_to_first_token_ms: Option<u64>,
+    last_word_to_first_token_ms: Option<u64>,
     generation_ms: Option<u64>,
     total_request_ms: Option<u64>,
     usage: Option<LlmUsageSummary>,
@@ -675,7 +695,7 @@ struct RequestSummary {
 
 impl RequestSummary {
     fn from_metrics(request_id: u64, metrics: RequestMetrics) -> Self {
-        let speech_end_ms = metrics.utterance_end_ms.or(metrics.speech_final_ms);
+        let speech_boundary_ms = metrics.utterance_end_ms.or(metrics.speech_final_ms);
         Self {
             request_id,
             question_chars: metrics.question.chars().count(),
@@ -691,7 +711,11 @@ impl RequestSummary {
             queue_wait_ms: duration(metrics.llm_started_ms, metrics.question_queued_ms),
             ttft_ms: duration(metrics.first_token_ms, metrics.llm_started_ms),
             queued_to_first_token_ms: duration(metrics.first_token_ms, metrics.question_queued_ms),
-            speech_end_to_first_token_ms: duration(metrics.first_token_ms, speech_end_ms),
+            speech_boundary_to_first_token_ms: duration(metrics.first_token_ms, speech_boundary_ms),
+            last_word_to_first_token_ms: duration(
+                metrics.first_token_ms,
+                metrics.last_word_end_elapsed_ms,
+            ),
             generation_ms: duration(metrics.completed_ms, metrics.first_token_ms),
             total_request_ms: duration(metrics.completed_ms, metrics.llm_started_ms),
             question: metrics.question,
@@ -701,6 +725,8 @@ impl RequestSummary {
             last_final_ms: metrics.last_final_ms,
             speech_final_ms: metrics.speech_final_ms,
             utterance_end_ms: metrics.utterance_end_ms,
+            last_word_end_audio_ms: metrics.last_word_end_audio_ms,
+            last_word_end_elapsed_ms: metrics.last_word_end_elapsed_ms,
             question_queued_ms: metrics.question_queued_ms,
             llm_started_ms: metrics.llm_started_ms,
             first_token_ms: metrics.first_token_ms,
@@ -753,7 +779,8 @@ struct AggregateSummary {
     queue_wait_ms: MetricSummary,
     ttft_ms: MetricSummary,
     queued_to_first_token_ms: MetricSummary,
-    speech_end_to_first_token_ms: MetricSummary,
+    speech_boundary_to_first_token_ms: MetricSummary,
+    last_word_to_first_token_ms: MetricSummary,
     generation_ms: MetricSummary,
     total_request_ms: MetricSummary,
 }
@@ -788,10 +815,15 @@ impl AggregateSummary {
                     .iter()
                     .filter_map(|request| request.queued_to_first_token_ms),
             ),
-            speech_end_to_first_token_ms: metric_summary(
+            speech_boundary_to_first_token_ms: metric_summary(
                 requests
                     .iter()
-                    .filter_map(|request| request.speech_end_to_first_token_ms),
+                    .filter_map(|request| request.speech_boundary_to_first_token_ms),
+            ),
+            last_word_to_first_token_ms: metric_summary(
+                requests
+                    .iter()
+                    .filter_map(|request| request.last_word_to_first_token_ms),
             ),
             generation_ms: metric_summary(
                 requests.iter().filter_map(|request| request.generation_ms),
@@ -1241,6 +1273,7 @@ mod tests {
                 speech_final: true,
                 audio_start_ms: Some(100),
                 audio_duration_ms: Some(900),
+                last_word_end_ms: Some(900),
             }))
             .expect("transcript must be recorded");
         recorder
@@ -1342,6 +1375,25 @@ mod tests {
 
         drop(recorder);
         fs::remove_dir_all(directory).expect("temporary directory must be removed");
+    }
+
+    #[test]
+    fn separates_boundary_and_last_word_latency() {
+        let summary = RequestSummary::from_metrics(
+            7,
+            RequestMetrics {
+                speech_final_ms: Some(1_600),
+                last_word_end_audio_ms: Some(1_000),
+                last_word_end_elapsed_ms: Some(1_100),
+                first_token_ms: Some(2_200),
+                ..RequestMetrics::default()
+            },
+        );
+
+        assert_eq!(summary.speech_boundary_to_first_token_ms, Some(600));
+        assert_eq!(summary.last_word_to_first_token_ms, Some(1_100));
+        assert_eq!(summary.last_word_end_audio_ms, Some(1_000));
+        assert_eq!(summary.last_word_end_elapsed_ms, Some(1_100));
     }
 
     fn config() -> Config {

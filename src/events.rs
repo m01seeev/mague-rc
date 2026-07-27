@@ -15,6 +15,7 @@ pub enum DeepgramEvent {
         speech_final: bool,
         audio_start_ms: Option<u64>,
         audio_duration_ms: Option<u64>,
+        last_word_end_ms: Option<u64>,
     },
     SpeechStarted {
         audio_timestamp_ms: Option<u64>,
@@ -102,6 +103,7 @@ pub enum SttObservation {
         speech_final: bool,
         audio_start_ms: Option<u64>,
         audio_duration_ms: Option<u64>,
+        last_word_end_ms: Option<u64>,
     },
     SpeechStarted {
         audio_timestamp_ms: Option<u64>,
