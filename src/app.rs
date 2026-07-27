@@ -395,6 +395,7 @@ async fn run_transcript_windows(
     let mut fallback_armed = false;
     let mut assembler = TranscriptWindowAssembler::new(config.min_utterance_chars);
     let mut pending_last_word_end_ms = None;
+    let mut interim_fallback_deferred = false;
     let mut paused = false;
     let mut commands_open = true;
 
@@ -408,6 +409,7 @@ async fn run_transcript_windows(
                         if paused {
                             assembler.discard_pending();
                             pending_last_word_end_ms = None;
+                            interim_fallback_deferred = false;
                             fallback_armed = false;
                             send_transcript_draft(&assembler, &output)?;
                         }
@@ -416,16 +418,29 @@ async fn run_transcript_windows(
                 }
             }
             _ = &mut fallback, if fallback_armed && !paused => {
-                flush_transcript_utterance(
-                    &mut assembler,
-                    &llm_requests,
-                    &output,
-                    &mut stats,
-                    "inactivity_timeout",
-                )
-                .await?;
-                pending_last_word_end_ms = None;
-                fallback_armed = false;
+                if assembler.has_unfinalized_interim() && !interim_fallback_deferred {
+                    debug!(
+                        module = "transcript",
+                        event = "inactivity_deferred",
+                        "waiting one more window for an unfinalized interim transcript"
+                    );
+                    fallback
+                        .as_mut()
+                        .reset(Instant::now() + fallback_duration);
+                    interim_fallback_deferred = true;
+                } else {
+                    flush_transcript_utterance(
+                        &mut assembler,
+                        &llm_requests,
+                        &output,
+                        &mut stats,
+                        "inactivity_timeout",
+                    )
+                    .await?;
+                    pending_last_word_end_ms = None;
+                    interim_fallback_deferred = false;
+                    fallback_armed = false;
+                }
             }
             event = events.recv() => match event {
                 Some(DeepgramEvent::Transcript { .. }) if paused => {}
@@ -447,6 +462,7 @@ async fn run_transcript_windows(
                         fallback
                             .as_mut()
                             .reset(Instant::now() + fallback_duration);
+                        interim_fallback_deferred = false;
                         fallback_armed = true;
                     }
                     if let Some(reason) = flush_reason {
@@ -459,6 +475,7 @@ async fn run_transcript_windows(
                         )
                         .await?;
                         pending_last_word_end_ms = None;
+                        interim_fallback_deferred = false;
                         fallback_armed = false;
                     }
                 }
@@ -963,7 +980,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inactivity_timeout_is_only_a_fallback() {
+    async fn inactivity_timeout_flushes_final_text() {
+        let (event_sender, event_receiver) = mpsc::unbounded_channel();
+        let (request_sender, mut request_receiver) = llm_request_channel(0);
+        let (output_sender, _output_receiver) = mpsc::unbounded_channel();
+        let (_command_sender, command_receiver) = mpsc::unbounded_channel();
+
+        event_sender
+            .send(DeepgramEvent::Transcript {
+                text: "незавершенная фраза".to_owned(),
+                is_final: true,
+                speech_final: false,
+                audio_start_ms: None,
+                audio_duration_ms: None,
+                last_word_end_ms: None,
+            })
+            .expect("interim transcript must send");
+
+        let worker = tokio::spawn(run_transcript_windows(
+            event_receiver,
+            request_sender,
+            output_sender,
+            command_receiver,
+            TranscriptConfig {
+                window_sec: 1,
+                min_utterance_chars: 3,
+            },
+            None,
+        ));
+
+        let request = timeout(Duration::from_secs(2), request_receiver.recv())
+            .await
+            .expect("fallback must fire after inactivity")
+            .expect("fallback must queue a request");
+        assert_eq!(request.text, "незавершенная фраза");
+
+        drop(event_sender);
+        let stats = worker
+            .await
+            .expect("transcript task must join")
+            .expect("transcript worker must stop cleanly");
+        assert_eq!(stats.chunks, 1);
+    }
+
+    #[tokio::test]
+    async fn inactivity_timeout_defers_unfinalized_interim_once() {
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
         let (request_sender, mut request_receiver) = llm_request_channel(0);
         let (output_sender, _output_receiver) = mpsc::unbounded_channel();
@@ -992,9 +1053,15 @@ mod tests {
             None,
         ));
 
-        let request = timeout(Duration::from_secs(2), request_receiver.recv())
+        assert!(
+            timeout(Duration::from_millis(1_500), request_receiver.recv())
+                .await
+                .is_err(),
+            "first inactivity window must not flush an interim transcript"
+        );
+        let request = timeout(Duration::from_secs(1), request_receiver.recv())
             .await
-            .expect("fallback must fire after inactivity")
+            .expect("second inactivity window must fire")
             .expect("fallback must queue a request");
         assert_eq!(request.text, "незавершенная фраза");
 

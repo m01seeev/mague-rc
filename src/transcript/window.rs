@@ -62,6 +62,10 @@ impl TranscriptWindowAssembler {
         parts.join(" ")
     }
 
+    pub fn has_unfinalized_interim(&self) -> bool {
+        !self.current_interim.is_empty()
+    }
+
     pub fn finish(&mut self) -> Option<TranscriptChunk> {
         let mut parts = std::mem::take(&mut self.pending_finals);
         if let Some(interim) = novel_text(&self.sent_interim, &self.current_interim) {
@@ -219,6 +223,18 @@ mod tests {
     #[test]
     fn empty_window_produces_no_chunk() {
         assert_eq!(assembler().flush(), None);
+    }
+
+    #[test]
+    fn reports_unfinalized_interim() {
+        let mut assembler = assembler();
+        assert!(!assembler.has_unfinalized_interim());
+
+        assembler.push_transcript("незаконченный вопрос", false);
+        assert!(assembler.has_unfinalized_interim());
+
+        assembler.push_transcript("законченный вопрос", true);
+        assert!(!assembler.has_unfinalized_interim());
     }
 
     #[test]
