@@ -2,7 +2,7 @@
 
 `mague-rc` is a local AI overlay for technical interviews, designed primarily for tiling window managers on Linux. Traditional desktop environments already have comparable assistant and overlay options, while tiling setups need a lightweight tool that integrates cleanly without replacing the window-management workflow.
 
-The initial target is Wayland with Hyprland. The current implementation captures system audio through `ffmpeg`, streams raw PCM to Deepgram, assembles recognition results into fixed transcript windows, and streams OpenRouter answers in a layer-shell window. A terminal mode remains available for diagnostics. RAG and screenshot processing are intentionally introduced in later stages.
+The initial target is Wayland with Hyprland. The current implementation captures system audio through `ffmpeg`, streams raw PCM to Deepgram, groups recognition results by detected utterance boundaries, and streams OpenRouter answers in a layer-shell window. A terminal mode remains available for diagnostics. RAG and screenshot processing are intentionally introduced in later stages.
 
 ## Requirements
 
@@ -47,7 +47,7 @@ Environment variables override values loaded from `.env`. The default tracing le
 cargo run
 ```
 
-This opens a GTK4 layer-shell panel centered along the top edge of the active output. The panel stays above regular windows without taking keyboard focus and keeps a scrollable history of questions and streaming answers. Its controls pause/resume new transcript windows, clear the visible and LLM conversation history, collapse/expand the panel, and shut the pipeline down cleanly. Pausing prevents new questions and answers while keeping audio capture and the Deepgram connection alive.
+This opens a GTK4 layer-shell panel centered along the top edge of the active output. The panel stays above regular windows without taking keyboard focus and keeps a scrollable history of questions and streaming answers. Its controls pause/resume recognition, clear the visible and LLM conversation history, collapse/expand the panel, and shut the pipeline down cleanly. Pausing prevents new questions and answers while keeping audio capture and the Deepgram connection alive.
 
 For the diagnostic terminal output instead:
 
@@ -57,13 +57,13 @@ cargo run -- --terminal
 
 ### Repeatable audio benchmark
 
-Replay a prerecorded file through the same `ffmpeg -> Deepgram -> transcript window -> OpenRouter` pipeline:
+Replay a prerecorded file through the same `ffmpeg -> Deepgram -> utterance segmentation -> OpenRouter` pipeline:
 
 ```bash
 cargo run -- --benchmark benchmark.wav baseline
 ```
 
-Playback and transcript-window timing start only after the Deepgram WebSocket is ready. Playback runs in real time, converts the file to the configured 16-bit mono PCM stream, and appends two seconds of silence so Deepgram can finalize the last utterance. The process stops automatically after pending transcript and LLM work is drained. This uses the configured provider APIs and therefore consumes Deepgram and OpenRouter quota.
+Playback and transcript timing start only after the Deepgram WebSocket is ready. Playback runs in real time, converts the file to the configured 16-bit mono PCM stream, and appends two seconds of silence so Deepgram can finalize the last utterance. The process stops automatically after pending transcript and LLM work is drained. This uses the configured provider APIs and therefore consumes Deepgram and OpenRouter quota.
 
 For accuracy measurements, create a UTF-8 reference file with one exact question per non-empty line:
 
@@ -99,9 +99,9 @@ cargo run -- --benchmark benchmark.wav utterance-end-01 --reference benchmark.ex
 
 Do not treat a run with `"git_dirty": true` as a reproducible result. Three questions are useful for functional iteration, but latency conclusions should be based on several repeated runs and preferably a larger fixed corpus.
 
-The process validates configuration, starts `ffmpeg`, and reads raw PCM from the configured PulseAudio-compatible source. PCM frames are streamed to Deepgram over an authenticated WebSocket and are not written to disk. Every `TRANSCRIPT_WINDOW_SEC` seconds, new recognized text is shown in the overlay; growing interim hypotheses only contribute their unsent tail. Text shorter than `MIN_UTTERANCE_CHARS` waits for more input.
+The process validates configuration, starts `ffmpeg`, and reads raw PCM from the configured PulseAudio-compatible source. PCM frames are streamed to Deepgram over an authenticated WebSocket and are not written to disk. Interim recognition is shown in the overlay immediately. A question is submitted when Deepgram emits `speech_final` or `UtteranceEnd`; `TRANSCRIPT_WINDOW_SEC` is only an inactivity fallback when neither boundary arrives. Text shorter than `MIN_UTTERANCE_CHARS` is discarded at a boundary.
 
-Each transcript window enters a sequential OpenRouter queue. Responses stream under an `ANSWER #<id> [voice]` heading, and the next request starts only after the current response completes or fails. Successful user/assistant pairs are retained up to `MAX_HISTORY_PAIRS`; failed and timed-out responses are not added to history. `TEXT_TIMEOUT_SEC`, `TEXT_TEMPERATURE`, and `TEXT_MAX_TOKENS` control the text model request.
+Each completed utterance enters a sequential OpenRouter queue. Responses stream under an `ANSWER #<id> [voice]` heading, and the next request starts only after the current response completes or fails. Successful user/assistant pairs are retained up to `MAX_HISTORY_PAIRS`; failed and timed-out responses are not added to history. `TEXT_TIMEOUT_SEC`, `TEXT_TEMPERATURE`, and `TEXT_MAX_TOKENS` control the text model request.
 
 Both `ffmpeg` and Deepgram reconnect automatically. Audio frames remain queued in memory and preserve their order while Deepgram is reconnecting. Use the close button or press Ctrl+C to close the WebSocket, stop `ffmpeg`, restore the terminal, and exit cleanly.
 
@@ -178,6 +178,6 @@ cargo test
 
 ## Current scope
 
-Implemented: typed configuration, redacted secrets, continuous PCM capture through `ffmpeg`, bounded/unbounded queues with backpressure, authenticated Deepgram WebSocket streaming, keepalive, final/interim event parsing, ordered reconnect with retry, fixed transcript windows with interim deduplication and shutdown flush, sequential OpenRouter streaming, timeout handling, four-pair voice history, unified output events, terminal output without interleaved streaming responses, a Hyprland-compatible layer-shell overlay, streaming UI updates, pipeline controls, structured diagnostics, repeatable file benchmarks with JSONL telemetry and WER/CER scoring, and graceful shutdown.
+Implemented: typed configuration, redacted secrets, continuous PCM capture through `ffmpeg`, bounded/unbounded queues with backpressure, authenticated Deepgram WebSocket streaming, keepalive, final/interim event parsing, ordered reconnect with retry, utterance-boundary segmentation with an inactivity fallback, sequential OpenRouter streaming, timeout handling, four-pair voice history, unified output events, terminal output without interleaved streaming responses, a Hyprland-compatible layer-shell overlay, streaming UI updates, pipeline controls, structured diagnostics, repeatable file benchmarks with JSONL telemetry and WER/CER scoring, and graceful shutdown.
 
 Not implemented: RAG, OCR, and screenshot flow. Seamless presenter-mode capture exclusion is available externally through the patched `hyprland-presenter` package described above; `mague-rc` itself does not modify the compositor.

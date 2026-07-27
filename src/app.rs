@@ -4,7 +4,7 @@ use thiserror::Error;
 use tokio::{
     sync::{mpsc, watch},
     task::{JoinError, JoinHandle},
-    time::{Instant, MissedTickBehavior, interval_at, timeout},
+    time::{Instant, sleep, timeout},
 };
 use tracing::{debug, info, warn};
 
@@ -75,7 +75,8 @@ where
         audio_source = %audio_source_label,
         stt_model = %config.deepgram.model,
         llm_model = %config.llm.model,
-        transcript_window_sec = config.transcript.window_sec,
+        transcript_segmentation = "deepgram_utterance",
+        transcript_inactivity_timeout_sec = config.transcript.window_sec,
         "mague-rc started; press Ctrl+C to stop"
     );
 
@@ -388,9 +389,10 @@ async fn run_transcript_windows(
         wait_for_transcript_readiness(readiness).await?;
     }
     let mut stats = TranscriptStats::default();
-    let window_duration = Duration::from_secs(config.window_sec);
-    let mut ticker = interval_at(Instant::now() + window_duration, window_duration);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let fallback_duration = Duration::from_secs(config.window_sec);
+    let fallback = sleep(fallback_duration);
+    tokio::pin!(fallback);
+    let mut fallback_armed = false;
     let mut assembler = TranscriptWindowAssembler::new(config.min_utterance_chars);
     let mut paused = false;
     let mut commands_open = true;
@@ -404,25 +406,52 @@ async fn run_transcript_windows(
                         paused = next_paused;
                         if paused {
                             assembler.discard_pending();
+                            fallback_armed = false;
                             send_transcript_draft(&assembler, &output)?;
                         }
                     }
                     None => commands_open = false,
                 }
             }
-            _ = ticker.tick(), if !paused => {
-                flush_transcript_window(
+            _ = &mut fallback, if fallback_armed && !paused => {
+                flush_transcript_utterance(
                     &mut assembler,
                     &llm_requests,
                     &output,
                     &mut stats,
-                    "timer",
+                    "inactivity_timeout",
                 )
                 .await?;
+                fallback_armed = false;
             }
             event = events.recv() => match event {
                 Some(DeepgramEvent::Transcript { .. }) if paused => {}
-                Some(event) => handle_deepgram_event(event, &mut assembler, &output, &mut stats)?,
+                Some(event) => {
+                    let has_transcript = matches!(
+                        &event,
+                        DeepgramEvent::Transcript { text, .. } if !text.is_empty()
+                    );
+                    let flush_reason =
+                        handle_deepgram_event(event, &mut assembler, &output, &mut stats)?;
+
+                    if has_transcript {
+                        fallback
+                            .as_mut()
+                            .reset(Instant::now() + fallback_duration);
+                        fallback_armed = true;
+                    }
+                    if let Some(reason) = flush_reason {
+                        flush_transcript_utterance(
+                            &mut assembler,
+                            &llm_requests,
+                            &output,
+                            &mut stats,
+                            reason,
+                        )
+                        .await?;
+                        fallback_armed = false;
+                    }
+                }
                 None => break,
             }
         }
@@ -437,7 +466,8 @@ fn handle_deepgram_event(
     assembler: &mut TranscriptWindowAssembler,
     output: &mpsc::UnboundedSender<OutputEvent>,
     stats: &mut TranscriptStats,
-) -> Result<(), TranscriptWorkerError> {
+) -> Result<Option<&'static str>, TranscriptWorkerError> {
+    let mut flush_reason = None;
     match event {
         DeepgramEvent::Status(status) => handle_stt_status(status, output)?,
         DeepgramEvent::Transcript {
@@ -477,6 +507,9 @@ fn handle_deepgram_event(
             }
             assembler.push_transcript(&text, is_final);
             send_transcript_draft(assembler, output)?;
+            if is_final && speech_final {
+                flush_reason = Some("speech_final");
+            }
         }
         DeepgramEvent::Transcript { .. } => {}
         DeepgramEvent::SpeechStarted { audio_timestamp_ms } => {
@@ -500,6 +533,7 @@ fn handle_deepgram_event(
                 event = "utterance_end",
                 "Deepgram detected utterance end"
             );
+            flush_reason = Some("utterance_end");
         }
         DeepgramEvent::Metadata => debug!(
             module = "stt",
@@ -522,7 +556,7 @@ fn handle_deepgram_event(
             )?;
         }
     }
-    Ok(())
+    Ok(flush_reason)
 }
 
 fn handle_stt_status(
@@ -568,14 +602,14 @@ fn handle_stt_status(
     )
 }
 
-async fn flush_transcript_window(
+async fn flush_transcript_utterance(
     assembler: &mut TranscriptWindowAssembler,
     llm_requests: &LlmRequestSender,
     output: &mpsc::UnboundedSender<OutputEvent>,
     stats: &mut TranscriptStats,
     reason: &'static str,
 ) -> Result<(), TranscriptWorkerError> {
-    queue_transcript_chunk(assembler.flush(), llm_requests, output, stats, reason).await?;
+    queue_transcript_chunk(assembler.finish(), llm_requests, output, stats, reason).await?;
     send_transcript_draft(assembler, output)
 }
 
@@ -614,11 +648,11 @@ async fn queue_transcript_chunk(
     let request_id = chunk.sequence;
     info!(
         module = "transcript",
-        event = "window_flushed",
+        event = "utterance_flushed",
         sequence = request_id,
         reason,
         text = %chunk.text,
-        "TRANSCRIPT WINDOW"
+        "TRANSCRIPT UTTERANCE"
     );
     send_output(
         output,
@@ -750,7 +784,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn shutdown_flush_queues_a_voice_request() {
+    async fn speech_final_queues_a_voice_request_immediately() {
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
         let (request_sender, mut request_receiver) = llm_request_channel(0);
         let (output_sender, mut output_receiver) = mpsc::unbounded_channel();
@@ -808,8 +842,125 @@ mod tests {
                 sequence: 0,
                 text,
                 flush_reason,
-            })) if text == "Что такое HashMap?" && flush_reason == "shutdown"
+            })) if text == "Что такое HashMap?" && flush_reason == "speech_final"
         ));
+    }
+
+    #[tokio::test]
+    async fn utterance_end_flushes_accumulated_final_transcripts_once() {
+        let (event_sender, event_receiver) = mpsc::unbounded_channel();
+        let (request_sender, mut request_receiver) = llm_request_channel(0);
+        let (output_sender, mut output_receiver) = mpsc::unbounded_channel();
+        let (_command_sender, command_receiver) = mpsc::unbounded_channel();
+
+        event_sender
+            .send(DeepgramEvent::Transcript {
+                text: "Чем HashMap отличается".to_owned(),
+                is_final: true,
+                speech_final: false,
+                audio_start_ms: None,
+                audio_duration_ms: None,
+            })
+            .expect("first final transcript must send");
+        event_sender
+            .send(DeepgramEvent::Transcript {
+                text: "от ConcurrentHashMap?".to_owned(),
+                is_final: true,
+                speech_final: false,
+                audio_start_ms: None,
+                audio_duration_ms: None,
+            })
+            .expect("second final transcript must send");
+        event_sender
+            .send(DeepgramEvent::UtteranceEnd {
+                last_word_end_ms: Some(2_000),
+            })
+            .expect("utterance end must send");
+        drop(event_sender);
+
+        let stats = run_transcript_windows(
+            event_receiver,
+            request_sender,
+            output_sender,
+            command_receiver,
+            TranscriptConfig {
+                window_sec: 60,
+                min_utterance_chars: 3,
+            },
+            None,
+        )
+        .await
+        .expect("transcript worker must stop cleanly");
+
+        assert_eq!(stats.chunks, 1);
+        assert_eq!(
+            request_receiver
+                .recv()
+                .await
+                .expect("utterance end must queue a request")
+                .text,
+            "Чем HashMap отличается от ConcurrentHashMap?"
+        );
+        assert_eq!(request_receiver.recv().await, None);
+
+        let mut submitted = None;
+        while let Ok(event) = output_receiver.try_recv() {
+            if let OutputEvent::Transcript(transcript) = event {
+                submitted = Some(transcript);
+            }
+        }
+        assert!(matches!(
+            submitted,
+            Some(TranscriptView {
+                text,
+                flush_reason,
+                ..
+            }) if text == "Чем HashMap отличается от ConcurrentHashMap?"
+                && flush_reason == "utterance_end"
+        ));
+    }
+
+    #[tokio::test]
+    async fn inactivity_timeout_is_only_a_fallback() {
+        let (event_sender, event_receiver) = mpsc::unbounded_channel();
+        let (request_sender, mut request_receiver) = llm_request_channel(0);
+        let (output_sender, _output_receiver) = mpsc::unbounded_channel();
+        let (_command_sender, command_receiver) = mpsc::unbounded_channel();
+
+        event_sender
+            .send(DeepgramEvent::Transcript {
+                text: "незавершенная фраза".to_owned(),
+                is_final: false,
+                speech_final: false,
+                audio_start_ms: None,
+                audio_duration_ms: None,
+            })
+            .expect("interim transcript must send");
+
+        let worker = tokio::spawn(run_transcript_windows(
+            event_receiver,
+            request_sender,
+            output_sender,
+            command_receiver,
+            TranscriptConfig {
+                window_sec: 1,
+                min_utterance_chars: 3,
+            },
+            None,
+        ));
+
+        let request = timeout(Duration::from_secs(2), request_receiver.recv())
+            .await
+            .expect("fallback must fire after inactivity")
+            .expect("fallback must queue a request");
+        assert_eq!(request.text, "незавершенная фраза");
+
+        drop(event_sender);
+        let stats = worker
+            .await
+            .expect("transcript task must join")
+            .expect("transcript worker must stop cleanly");
+        assert_eq!(stats.chunks, 1);
     }
 
     #[test]
