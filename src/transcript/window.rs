@@ -54,6 +54,14 @@ impl TranscriptWindowAssembler {
         Some(self.chunk(text))
     }
 
+    pub fn preview(&self) -> String {
+        let mut parts = self.pending_finals.clone();
+        if let Some(interim) = novel_text(&self.sent_interim, &self.current_interim) {
+            parts.push(interim);
+        }
+        parts.join(" ")
+    }
+
     pub fn finish(&mut self) -> Option<TranscriptChunk> {
         let mut parts = std::mem::take(&mut self.pending_finals);
         if let Some(interim) = novel_text(&self.sent_interim, &self.current_interim) {
@@ -151,6 +159,24 @@ mod tests {
 
         assembler.push_transcript("расскажите про hash map и устройство", false);
         assert_eq!(text(assembler.flush()), Some("map и устройство".to_owned()));
+    }
+
+    #[test]
+    fn previews_only_text_not_sent_to_the_llm() {
+        let mut assembler = assembler();
+        assembler.push_transcript("расскажите про hash", false);
+        assert_eq!(assembler.preview(), "расскажите про hash");
+
+        assert!(assembler.flush().is_some());
+        assert!(assembler.preview().is_empty());
+
+        assembler.push_transcript("расскажите про hash map внутри", false);
+        assert_eq!(assembler.preview(), "map внутри");
+
+        assembler.push_transcript("расскажите про hash map внутри", true);
+        assert_eq!(assembler.preview(), "map внутри");
+        assert!(assembler.flush().is_some());
+        assert!(assembler.preview().is_empty());
     }
 
     #[test]

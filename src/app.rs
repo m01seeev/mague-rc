@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
 use thiserror::Error;
 use tokio::{
@@ -15,8 +15,8 @@ use crate::{
     error::AppError,
     events::{
         AppCommand, AppErrorView, DeepgramEvent, LlmCommand, LlmRequest, Mode, OutputComponent,
-        OutputEvent, QueueKind, QueueState, StatusKind, StatusMessage, SttStatus, TranscriptChunk,
-        TranscriptView,
+        OutputEvent, QueueKind, QueueState, StatusKind, StatusMessage, SttObservation, SttStatus,
+        TranscriptChunk, TranscriptView,
     },
     llm::{
         LlmQueueError, LlmRequestSender, LlmWorker, OpenRouterTextProvider, llm_request_channel,
@@ -27,6 +27,13 @@ use crate::{
 };
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const BENCHMARK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(300);
+const BENCHMARK_EOF_DRAIN: Duration = Duration::from_millis(750);
+
+#[derive(Clone, Debug, Default)]
+pub struct RunOptions {
+    pub audio_file: Option<PathBuf>,
+}
 
 pub async fn run(config: Config) -> Result<(), AppError> {
     let (_command_sender, command_receiver) = mpsc::unbounded_channel();
@@ -36,18 +43,36 @@ pub async fn run(config: Config) -> Result<(), AppError> {
 pub async fn run_with_sink<S>(
     config: Config,
     sink: S,
+    app_commands: mpsc::UnboundedReceiver<AppCommand>,
+) -> Result<(), AppError>
+where
+    S: OutputSink,
+    S::Error: std::fmt::Display,
+{
+    run_with_sink_options(config, sink, app_commands, RunOptions::default()).await
+}
+
+pub async fn run_with_sink_options<S>(
+    config: Config,
+    sink: S,
     mut app_commands: mpsc::UnboundedReceiver<AppCommand>,
+    options: RunOptions,
 ) -> Result<(), AppError>
 where
     S: OutputSink,
     S::Error: std::fmt::Display,
 {
     let _terminal_echo_guard = TerminalEchoGuard::hide_control_characters();
+    let audio_source_label = options.audio_file.as_ref().map_or_else(
+        || config.audio.source.clone(),
+        |path| path.display().to_string(),
+    );
+    let benchmark_mode = options.audio_file.is_some();
 
     info!(
         module = "app",
         event = "started",
-        audio_source = %config.audio.source,
+        audio_source = %audio_source_label,
         stt_model = %config.deepgram.model,
         llm_model = %config.llm.model,
         transcript_window_sec = config.transcript.window_sec,
@@ -68,29 +93,59 @@ where
             kind: StatusKind::Started,
             text: format!(
                 "source={} | STT={} | LLM={}",
-                config.audio.source, config.deepgram.model, config.llm.model
+                audio_source_label, config.deepgram.model, config.llm.model
             ),
         }),
     )?;
 
-    let audio_source = FfmpegAudioSource::new(
-        config.audio.clone(),
-        config.deepgram.sample_rate,
-        config.deepgram.channels,
-    );
+    let audio_source = match options.audio_file {
+        Some(path) => FfmpegAudioSource::from_file(
+            config.audio.clone(),
+            config.deepgram.sample_rate,
+            config.deepgram.channels,
+            path,
+        ),
+        None => FfmpegAudioSource::new(
+            config.audio.clone(),
+            config.deepgram.sample_rate,
+            config.deepgram.channels,
+        ),
+    };
     let stt_provider = DeepgramSttProvider::new(config.deepgram.clone());
     let llm_provider = OpenRouterTextProvider::new(config.llm.clone())?;
     let llm_worker = LlmWorker::new(llm_provider, config.llm);
 
-    let mut audio_task = tokio::spawn(audio_source.run(frame_sender, shutdown_receiver.clone()));
-    let mut stt_task =
-        tokio::spawn(stt_provider.run(frame_receiver, stt_event_sender, shutdown_receiver));
+    let frame_sender_guard = frame_sender.clone();
+    let (readiness_sender, readiness_receiver) = watch::channel(false);
+    let transcript_readiness = benchmark_mode.then(|| readiness_receiver.clone());
+    let audio_shutdown = shutdown_receiver.clone();
+    let mut audio_task = if benchmark_mode {
+        tokio::spawn(async move {
+            wait_for_stt_readiness(readiness_receiver).await?;
+            audio_source.run(frame_sender, audio_shutdown).await
+        })
+    } else {
+        drop(readiness_receiver);
+        tokio::spawn(audio_source.run(frame_sender, audio_shutdown))
+    };
+    let mut stt_task = if benchmark_mode {
+        tokio::spawn(stt_provider.run_with_readiness(
+            frame_receiver,
+            stt_event_sender,
+            shutdown_receiver,
+            readiness_sender,
+        ))
+    } else {
+        drop(readiness_sender);
+        tokio::spawn(stt_provider.run(frame_receiver, stt_event_sender, shutdown_receiver))
+    };
     let mut transcript_task = tokio::spawn(run_transcript_windows(
         stt_event_receiver,
         llm_request_sender,
         output_sender.clone(),
         transcript_command_receiver,
         config.transcript,
+        transcript_readiness,
     ));
     let mut llm_task = tokio::spawn(llm_worker.run(
         llm_request_receiver,
@@ -179,7 +234,18 @@ where
                 }
             }
             result = &mut audio_task => {
+                let completed_file = benchmark_mode && matches!(&result, Ok(Ok(())));
                 audio_completed = Some(result);
+                if completed_file {
+                    info!(
+                        module = "app",
+                        event = "benchmark_audio_completed",
+                        drain_ms = BENCHMARK_EOF_DRAIN.as_millis(),
+                        "benchmark audio reached EOF"
+                    );
+                    tokio::time::sleep(BENCHMARK_EOF_DRAIN).await;
+                    break StopReason::BenchmarkEof;
+                }
                 break StopReason::Audio;
             }
             result = &mut stt_task => {
@@ -208,12 +274,24 @@ where
             "pipeline workers already closed their shutdown channels"
         );
     }
+    drop(frame_sender_guard);
 
-    let audio_result = finish_task("audio", &mut audio_task, audio_completed).await?;
-    let stt_result = finish_task("stt", &mut stt_task, stt_completed).await?;
-    let transcript_stats =
-        finish_task("transcript", &mut transcript_task, transcript_completed).await?;
-    let llm_stats = finish_task("LLM", &mut llm_task, llm_completed).await?;
+    let shutdown_timeout = if benchmark_mode {
+        BENCHMARK_SHUTDOWN_TIMEOUT
+    } else {
+        SHUTDOWN_TIMEOUT
+    };
+    let audio_result =
+        finish_task("audio", &mut audio_task, audio_completed, shutdown_timeout).await?;
+    let stt_result = finish_task("stt", &mut stt_task, stt_completed, shutdown_timeout).await?;
+    let transcript_stats = finish_task(
+        "transcript",
+        &mut transcript_task,
+        transcript_completed,
+        shutdown_timeout,
+    )
+    .await?;
+    let llm_stats = finish_task("LLM", &mut llm_task, llm_completed, shutdown_timeout).await?;
     if output_sender
         .send(OutputEvent::Status(StatusMessage {
             kind: StatusKind::Stopped,
@@ -228,7 +306,13 @@ where
         );
     }
     drop(output_sender);
-    let output_stats = finish_task("output", &mut output_task, output_completed).await?;
+    let output_stats = finish_task(
+        "output",
+        &mut output_task,
+        output_completed,
+        shutdown_timeout,
+    )
+    .await?;
 
     flatten_audio_task(audio_result)?;
     flatten_stt_task(stt_result)?;
@@ -259,6 +343,7 @@ where
 enum StopReason {
     Signal,
     Command,
+    BenchmarkEof,
     Audio,
     Stt,
     Transcript,
@@ -269,7 +354,7 @@ enum StopReason {
 impl StopReason {
     fn unexpected_worker(self) -> Option<&'static str> {
         match self {
-            Self::Signal | Self::Command => None,
+            Self::Signal | Self::Command | Self::BenchmarkEof => None,
             Self::Audio => Some("audio"),
             Self::Stt => Some("stt"),
             Self::Transcript => Some("transcript"),
@@ -297,7 +382,11 @@ async fn run_transcript_windows(
     output: mpsc::UnboundedSender<OutputEvent>,
     mut commands: mpsc::UnboundedReceiver<TranscriptCommand>,
     config: TranscriptConfig,
+    readiness: Option<watch::Receiver<bool>>,
 ) -> Result<TranscriptStats, TranscriptWorkerError> {
+    if let Some(readiness) = readiness {
+        wait_for_transcript_readiness(readiness).await?;
+    }
     let mut stats = TranscriptStats::default();
     let window_duration = Duration::from_secs(config.window_sec);
     let mut ticker = interval_at(Instant::now() + window_duration, window_duration);
@@ -315,6 +404,7 @@ async fn run_transcript_windows(
                         paused = next_paused;
                         if paused {
                             assembler.discard_pending();
+                            send_transcript_draft(&assembler, &output)?;
                         }
                     }
                     None => commands_open = false,
@@ -354,8 +444,20 @@ fn handle_deepgram_event(
             text,
             is_final,
             speech_final,
+            audio_start_ms,
+            audio_duration_ms,
         } if !text.is_empty() => {
             stats.transcripts += 1;
+            send_output(
+                output,
+                OutputEvent::SttObservation(SttObservation::Transcript {
+                    text: text.clone(),
+                    is_final,
+                    speech_final,
+                    audio_start_ms,
+                    audio_duration_ms,
+                }),
+            )?;
             if is_final {
                 stats.final_transcripts += 1;
                 debug!(
@@ -374,18 +476,31 @@ fn handle_deepgram_event(
                 );
             }
             assembler.push_transcript(&text, is_final);
+            send_transcript_draft(assembler, output)?;
         }
         DeepgramEvent::Transcript { .. } => {}
-        DeepgramEvent::SpeechStarted => debug!(
-            module = "stt",
-            event = "speech_started",
-            "Deepgram detected speech"
-        ),
-        DeepgramEvent::UtteranceEnd => debug!(
-            module = "stt",
-            event = "utterance_end",
-            "Deepgram detected utterance end"
-        ),
+        DeepgramEvent::SpeechStarted { audio_timestamp_ms } => {
+            send_output(
+                output,
+                OutputEvent::SttObservation(SttObservation::SpeechStarted { audio_timestamp_ms }),
+            )?;
+            debug!(
+                module = "stt",
+                event = "speech_started",
+                "Deepgram detected speech"
+            );
+        }
+        DeepgramEvent::UtteranceEnd { last_word_end_ms } => {
+            send_output(
+                output,
+                OutputEvent::SttObservation(SttObservation::UtteranceEnd { last_word_end_ms }),
+            )?;
+            debug!(
+                module = "stt",
+                event = "utterance_end",
+                "Deepgram detected utterance end"
+            );
+        }
         DeepgramEvent::Metadata => debug!(
             module = "stt",
             event = "metadata",
@@ -460,7 +575,20 @@ async fn flush_transcript_window(
     stats: &mut TranscriptStats,
     reason: &'static str,
 ) -> Result<(), TranscriptWorkerError> {
-    queue_transcript_chunk(assembler.flush(), llm_requests, output, stats, reason).await
+    queue_transcript_chunk(assembler.flush(), llm_requests, output, stats, reason).await?;
+    send_transcript_draft(assembler, output)
+}
+
+fn send_transcript_draft(
+    assembler: &TranscriptWindowAssembler,
+    output: &mpsc::UnboundedSender<OutputEvent>,
+) -> Result<(), TranscriptWorkerError> {
+    send_output(
+        output,
+        OutputEvent::TranscriptDraft {
+            text: assembler.preview(),
+        },
+    )
 }
 
 async fn finish_transcript_window(
@@ -497,6 +625,7 @@ async fn queue_transcript_chunk(
         OutputEvent::Transcript(TranscriptView {
             sequence: request_id,
             text: chunk.text.clone(),
+            flush_reason: reason.to_owned(),
         }),
     )?;
     llm_requests
@@ -543,16 +672,46 @@ pub enum TranscriptWorkerError {
 
     #[error("output channel closed")]
     OutputChannelClosed,
+
+    #[error("STT worker stopped before benchmark transcript timing could start")]
+    SttReadinessClosed,
+}
+
+async fn wait_for_stt_readiness(mut readiness: watch::Receiver<bool>) -> Result<(), AudioError> {
+    loop {
+        if *readiness.borrow_and_update() {
+            return Ok(());
+        }
+        readiness
+            .changed()
+            .await
+            .map_err(|_| AudioError::SttReadinessClosed)?;
+    }
+}
+
+async fn wait_for_transcript_readiness(
+    mut readiness: watch::Receiver<bool>,
+) -> Result<(), TranscriptWorkerError> {
+    loop {
+        if *readiness.borrow_and_update() {
+            return Ok(());
+        }
+        readiness
+            .changed()
+            .await
+            .map_err(|_| TranscriptWorkerError::SttReadinessClosed)?;
+    }
 }
 
 async fn finish_task<T>(
     name: &'static str,
     task: &mut JoinHandle<T>,
     completed: Option<Result<T, JoinError>>,
+    shutdown_timeout: Duration,
 ) -> Result<T, AppError> {
     let result = match completed {
         Some(result) => result,
-        None => match timeout(SHUTDOWN_TIMEOUT, &mut *task).await {
+        None => match timeout(shutdown_timeout, &mut *task).await {
             Ok(result) => result,
             Err(_) => {
                 task.abort();
@@ -601,6 +760,8 @@ mod tests {
                 text: "Что такое HashMap?".to_owned(),
                 is_final: true,
                 speech_final: true,
+                audio_start_ms: Some(100),
+                audio_duration_ms: Some(900),
             })
             .expect("STT event must send");
         drop(event_sender);
@@ -614,6 +775,7 @@ mod tests {
                 window_sec: 60,
                 min_utterance_chars: 3,
             },
+            None,
         )
         .await
         .expect("transcript worker must stop cleanly");
@@ -628,11 +790,106 @@ mod tests {
         assert_eq!(request.text, "Что такое HashMap?");
         assert!(matches!(
             output_receiver.recv().await,
+            Some(OutputEvent::SttObservation(SttObservation::Transcript {
+                text,
+                is_final: true,
+                speech_final: true,
+                audio_start_ms: Some(100),
+                audio_duration_ms: Some(900),
+            })) if text == "Что такое HashMap?"
+        ));
+        assert!(matches!(
+            output_receiver.recv().await,
+            Some(OutputEvent::TranscriptDraft { text }) if text == "Что такое HashMap?"
+        ));
+        assert!(matches!(
+            output_receiver.recv().await,
             Some(OutputEvent::Transcript(TranscriptView {
                 sequence: 0,
                 text,
-            })) if text == "Что такое HashMap?"
+                flush_reason,
+            })) if text == "Что такое HashMap?" && flush_reason == "shutdown"
         ));
+    }
+
+    #[test]
+    fn forwards_growing_interim_text_as_a_draft() {
+        let (output_sender, mut output_receiver) = mpsc::unbounded_channel();
+        let mut assembler = TranscriptWindowAssembler::new(3);
+        let mut stats = TranscriptStats::default();
+
+        handle_deepgram_event(
+            DeepgramEvent::Transcript {
+                text: "что такое".to_owned(),
+                is_final: false,
+                speech_final: false,
+                audio_start_ms: None,
+                audio_duration_ms: None,
+            },
+            &mut assembler,
+            &output_sender,
+            &mut stats,
+        )
+        .expect("interim transcript must be forwarded");
+        handle_deepgram_event(
+            DeepgramEvent::Transcript {
+                text: "что такое HashMap".to_owned(),
+                is_final: false,
+                speech_final: false,
+                audio_start_ms: None,
+                audio_duration_ms: None,
+            },
+            &mut assembler,
+            &output_sender,
+            &mut stats,
+        )
+        .expect("growing interim transcript must be forwarded");
+
+        assert_eq!(
+            output_receiver.try_recv(),
+            Ok(OutputEvent::SttObservation(SttObservation::Transcript {
+                text: "что такое".to_owned(),
+                is_final: false,
+                speech_final: false,
+                audio_start_ms: None,
+                audio_duration_ms: None,
+            }))
+        );
+        assert_eq!(
+            output_receiver.try_recv(),
+            Ok(OutputEvent::TranscriptDraft {
+                text: "что такое".to_owned(),
+            })
+        );
+        assert_eq!(
+            output_receiver.try_recv(),
+            Ok(OutputEvent::SttObservation(SttObservation::Transcript {
+                text: "что такое HashMap".to_owned(),
+                is_final: false,
+                speech_final: false,
+                audio_start_ms: None,
+                audio_duration_ms: None,
+            }))
+        );
+        assert_eq!(
+            output_receiver.try_recv(),
+            Ok(OutputEvent::TranscriptDraft {
+                text: "что такое HashMap".to_owned(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn benchmark_readiness_waits_for_stt_connection() {
+        let (sender, receiver) = watch::channel(false);
+        let wait = tokio::spawn(wait_for_transcript_readiness(receiver));
+        tokio::task::yield_now().await;
+        assert!(!wait.is_finished());
+
+        sender.send(true).expect("readiness must be delivered");
+        wait.await
+            .expect("wait task must finish")
+            .expect("readiness must succeed");
     }
 
     #[test]

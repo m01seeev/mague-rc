@@ -75,6 +75,9 @@ impl TerminalRenderer {
                 writeln!(writer, "ERROR [{}]: {}", error.component, error.message)?;
                 self.flush_pending(writer)?;
             }
+            OutputEvent::SttObservation(_)
+            | OutputEvent::TranscriptDraft { .. }
+            | OutputEvent::AnswerUsage { .. } => {}
             OutputEvent::AnswerDelta { .. } | OutputEvent::AnswerCompleted { .. } => {}
             event if self.active_answer.is_some() => self.pending.push_back(event),
             event => self.render_passive(writer, event)?,
@@ -119,6 +122,9 @@ impl TerminalRenderer {
                     transcript.sequence, transcript.text
                 )?;
             }
+            OutputEvent::SttObservation(_)
+            | OutputEvent::TranscriptDraft { .. }
+            | OutputEvent::AnswerUsage { .. } => {}
             OutputEvent::AnswerStarted(meta) => {
                 self.stats.started += 1;
                 self.active_answer = Some(meta.request_id);
@@ -230,6 +236,7 @@ mod tests {
                 OutputEvent::Transcript(TranscriptView {
                     sequence: 4,
                     text: "Следующий вопрос".to_owned(),
+                    flush_reason: "test".to_owned(),
                 }),
             )
             .expect("transcript must buffer");

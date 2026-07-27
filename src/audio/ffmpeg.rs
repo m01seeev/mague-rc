@@ -25,6 +25,7 @@ const BYTES_PER_SAMPLE: u64 = 2;
 const RESTART_DELAY: Duration = Duration::from_secs(2);
 const CHILD_STOP_TIMEOUT: Duration = Duration::from_secs(3);
 const QUEUE_WARNING_STEP: usize = 100;
+const FILE_PADDING_SECONDS: u64 = 2;
 
 #[derive(Debug, Error)]
 pub enum AudioError {
@@ -52,19 +53,42 @@ pub enum AudioError {
 
     #[error("audio frame channel closed")]
     ChannelClosed,
+
+    #[error("STT worker stopped before benchmark audio playback could start")]
+    SttReadinessClosed,
+
+    #[error("ffmpeg file playback exited with status {0}")]
+    FilePlayback(ExitStatus),
 }
 
 pub struct FfmpegAudioSource {
     config: AudioConfig,
+    input: FfmpegInput,
     sample_rate: u32,
     channels: u16,
     next_sequence: u64,
+}
+
+enum FfmpegInput {
+    Live,
+    File(PathBuf),
 }
 
 impl FfmpegAudioSource {
     pub fn new(config: AudioConfig, sample_rate: u32, channels: u16) -> Self {
         Self {
             config,
+            input: FfmpegInput::Live,
+            sample_rate,
+            channels,
+            next_sequence: 0,
+        }
+    }
+
+    pub fn from_file(config: AudioConfig, sample_rate: u32, channels: u16, path: PathBuf) -> Self {
+        Self {
+            config,
+            input: FfmpegInput::File(path),
             sample_rate,
             channels,
             next_sequence: 0,
@@ -87,6 +111,18 @@ impl FfmpegAudioSource {
             match self.capture_once(chunk_size, &output, &mut shutdown).await {
                 Ok(CaptureOutcome::Shutdown) => return Ok(()),
                 Ok(CaptureOutcome::Exited(status)) => {
+                    if matches!(self.input, FfmpegInput::File(_)) {
+                        if status.success() {
+                            info!(
+                                module = "audio",
+                                event = "file_completed",
+                                frame_count = self.next_sequence,
+                                "audio file playback completed"
+                            );
+                            return Ok(());
+                        }
+                        return Err(AudioError::FilePlayback(status));
+                    }
                     retry_count += 1;
                     warn!(
                         module = "audio",
@@ -136,7 +172,7 @@ impl FfmpegAudioSource {
         info!(
             module = "audio",
             event = "capture_started",
-            source = %self.config.source,
+            source = %self.input_description(),
             sample_rate = self.sample_rate,
             channels = self.channels,
             chunk_ms = self.config.chunk_ms,
@@ -182,14 +218,27 @@ impl FfmpegAudioSource {
 
     fn spawn(&self) -> Result<Child, AudioError> {
         let mut command = Command::new(&self.config.ffmpeg_bin);
+        command.arg("-hide_banner").arg("-loglevel").arg("error");
+
+        match &self.input {
+            FfmpegInput::Live => {
+                command
+                    .arg("-f")
+                    .arg(&self.config.input_format)
+                    .arg("-i")
+                    .arg(&self.config.source);
+            }
+            FfmpegInput::File(path) => {
+                command
+                    .arg("-re")
+                    .arg("-i")
+                    .arg(path)
+                    .arg("-af")
+                    .arg(format!("apad=pad_dur={FILE_PADDING_SECONDS}"));
+            }
+        }
+
         command
-            .arg("-hide_banner")
-            .arg("-loglevel")
-            .arg("error")
-            .arg("-f")
-            .arg(&self.config.input_format)
-            .arg("-i")
-            .arg(&self.config.source)
             .arg("-ac")
             .arg(self.channels.to_string())
             .arg("-ar")
@@ -206,6 +255,13 @@ impl FfmpegAudioSource {
             executable: self.config.ffmpeg_bin.clone(),
             source,
         })
+    }
+
+    fn input_description(&self) -> String {
+        match &self.input {
+            FfmpegInput::Live => self.config.source.clone(),
+            FfmpegInput::File(path) => path.display().to_string(),
+        }
     }
 
     async fn read_frames(
@@ -402,5 +458,24 @@ mod tests {
         let error = pcm_chunk_size(0, 1, 100).expect_err("zero sample rate must fail");
 
         assert!(matches!(error, AudioError::InvalidChunkSize(_)));
+    }
+
+    #[tokio::test]
+    async fn file_source_stops_after_successful_eof() {
+        let config = AudioConfig {
+            ffmpeg_bin: PathBuf::from("/bin/true"),
+            input_format: "pulse".to_owned(),
+            source: "unused".to_owned(),
+            chunk_ms: 100,
+            queue_max: 0,
+        };
+        let source = FfmpegAudioSource::from_file(config, 16_000, 1, PathBuf::from("fixture.wav"));
+        let (sender, _receiver) = crate::audio::audio_frame_channel(0);
+        let (_shutdown_sender, shutdown_receiver) = watch::channel(false);
+
+        source
+            .run(sender, shutdown_receiver)
+            .await
+            .expect("successful file EOF must stop the source");
     }
 }

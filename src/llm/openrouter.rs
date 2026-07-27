@@ -7,7 +7,8 @@ use url::Url;
 
 use crate::{
     config::LlmConfig,
-    llm::{ChatMessage, ChatRequest, LlmError, TextLlmProvider, TextStream},
+    events::LlmUsage,
+    llm::{ChatMessage, ChatRequest, LlmError, LlmStreamEvent, TextLlmProvider, TextStream},
 };
 
 const MAX_ERROR_BODY_CHARS: usize = 1_000;
@@ -68,7 +69,8 @@ impl TextLlmProvider for OpenRouterTextProvider {
                         completed = true;
                         break;
                     }
-                    StreamData::Delta(delta) => yield delta,
+                    StreamData::Delta(delta) => yield LlmStreamEvent::Delta(delta),
+                    StreamData::Usage(usage) => yield LlmStreamEvent::Usage(usage),
                     StreamData::Empty => {}
                 }
             }
@@ -103,6 +105,7 @@ struct ChatCompletionChunk {
     #[serde(default)]
     choices: Vec<StreamingChoice>,
     error: Option<ApiError>,
+    usage: Option<Usage>,
 }
 
 #[derive(Deserialize)]
@@ -126,9 +129,21 @@ struct ApiError {
     message: String,
 }
 
+#[derive(Deserialize)]
+struct Usage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+    #[serde(default)]
+    total_tokens: u64,
+    cost: Option<f64>,
+}
+
 enum StreamData {
     Done,
     Delta(String),
+    Usage(LlmUsage),
     Empty,
 }
 
@@ -141,6 +156,14 @@ fn parse_stream_data(data: &str) -> Result<StreamData, LlmError> {
         serde_json::from_str(data).map_err(|error| LlmError::Protocol(error.to_string()))?;
     if let Some(error) = chunk.error {
         return Err(provider_error(error));
+    }
+    if let Some(usage) = chunk.usage {
+        return Ok(StreamData::Usage(LlmUsage {
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+            cost: usage.cost,
+        }));
     }
 
     let content = chunk
@@ -237,6 +260,18 @@ mod tests {
             parse_stream_data("[DONE]").expect("marker must parse"),
             StreamData::Done
         ));
+        assert!(matches!(
+            parse_stream_data(
+                r#"{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":4,"total_tokens":16,"cost":0.0002}}"#
+            )
+            .expect("usage must parse"),
+            StreamData::Usage(LlmUsage {
+                prompt_tokens: 12,
+                completion_tokens: 4,
+                total_tokens: 16,
+                cost: Some(cost),
+            }) if (cost - 0.0002).abs() < f64::EPSILON
+        ));
     }
 
     #[test]
@@ -289,6 +324,7 @@ mod tests {
                 ": OPENROUTER PROCESSING\n\n",
                 "data: {\"choices\":[{\"delta\":{\"content\":\"первая \"}}]}\n\n",
                 "data: {\"choices\":[{\"delta\":{\"content\":\"часть\"}}]}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12,\"cost\":0.0001}}\n\n",
                 "data: [DONE]\n\n"
             );
             let response = format!(
@@ -319,11 +355,24 @@ mod tests {
             messages: vec![ChatMessage::system("system")],
         });
         let mut response = String::new();
-        while let Some(delta) = stream.next().await {
-            response.push_str(&delta.expect("stream item must succeed"));
+        let mut usage = None;
+        while let Some(event) = stream.next().await {
+            match event.expect("stream item must succeed") {
+                LlmStreamEvent::Delta(delta) => response.push_str(&delta),
+                LlmStreamEvent::Usage(value) => usage = Some(value),
+            }
         }
 
         assert_eq!(response, "первая часть");
+        assert_eq!(
+            usage,
+            Some(LlmUsage {
+                prompt_tokens: 10,
+                completion_tokens: 2,
+                total_tokens: 12,
+                cost: Some(0.0001),
+            })
+        );
         server.await.expect("mock server must stop");
     }
 

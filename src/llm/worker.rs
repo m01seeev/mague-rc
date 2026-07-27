@@ -10,7 +10,7 @@ use crate::{
     events::{AnswerMeta, AppErrorView, LlmCommand, LlmRequest, OutputComponent, OutputEvent},
     llm::{
         ChatMessage, ChatRequest, ConversationHistories, LlmError, LlmRequestReceiver,
-        TextLlmProvider, voice_system_prompt,
+        LlmStreamEvent, TextLlmProvider, voice_system_prompt,
     },
 };
 
@@ -163,7 +163,7 @@ where
             tokio::select! {
                 _ = &mut deadline => return Err(LlmError::Timeout(timeout_duration)),
                 item = stream.next() => match item {
-                    Some(Ok(delta)) if !delta.is_empty() => {
+                    Some(Ok(LlmStreamEvent::Delta(delta))) if !delta.is_empty() => {
                         if first_token_at.is_none() {
                             let latency = started_at.elapsed();
                             first_token_at = Some(latency);
@@ -188,7 +188,17 @@ where
                         )
                         .map_err(|_| LlmError::Request("output channel closed".to_owned()))?;
                     }
-                    Some(Ok(_)) => {}
+                    Some(Ok(LlmStreamEvent::Usage(usage))) => {
+                        send_event(
+                            events,
+                            OutputEvent::AnswerUsage {
+                                request_id: request.request_id,
+                                usage,
+                            },
+                        )
+                        .map_err(|_| LlmError::Request("output channel closed".to_owned()))?;
+                    }
+                    Some(Ok(LlmStreamEvent::Delta(_))) => {}
                     Some(Err(error)) => return Err(error),
                     None => break,
                 }
@@ -232,7 +242,7 @@ mod tests {
     use crate::{
         config::SecretString,
         events::Mode,
-        llm::{ChatRole, TextStream, llm_request_channel},
+        llm::{ChatRole, LlmStreamEvent, TextStream, llm_request_channel},
     };
 
     use super::*;
@@ -253,8 +263,8 @@ mod tests {
                 requests.len()
             };
             Box::pin(stream::iter([
-                Ok(format!("answer {response_number}")),
-                Ok(" done".to_owned()),
+                Ok(LlmStreamEvent::Delta(format!("answer {response_number}"))),
+                Ok(LlmStreamEvent::Delta(" done".to_owned())),
             ]))
         }
     }

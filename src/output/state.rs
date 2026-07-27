@@ -18,18 +18,37 @@ pub enum WorkerStatus {
     Error,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AnswerStatus {
+    #[default]
+    Pending,
+    Streaming,
+    Completed,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConversationTurn {
+    pub request_id: u64,
+    pub question: String,
+    pub answer: String,
+    pub answer_status: AnswerStatus,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AppSnapshot {
     pub running: bool,
     pub listening: bool,
     pub stt_status: ConnectionStatus,
     pub llm_status: WorkerStatus,
+    pub transcript_draft: String,
     pub current_transcript: String,
     pub current_answer_id: Option<u64>,
     pub current_answer: String,
     pub audio_queue_len: usize,
     pub llm_queue_len: usize,
     pub last_error: Option<AppErrorView>,
+    pub conversation: Vec<ConversationTurn>,
 }
 
 impl AppSnapshot {
@@ -55,9 +74,11 @@ impl AppSnapshot {
                     self.stt_status = ConnectionStatus::Reconnecting;
                 }
                 StatusKind::HistoryCleared => {
+                    self.transcript_draft.clear();
                     self.current_transcript.clear();
                     self.current_answer_id = None;
                     self.current_answer.clear();
+                    self.conversation.clear();
                 }
                 StatusKind::Stopped => {
                     self.running = false;
@@ -66,27 +87,67 @@ impl AppSnapshot {
                     self.llm_status = WorkerStatus::Idle;
                 }
             },
+            OutputEvent::TranscriptDraft { text } => {
+                self.transcript_draft.clone_from(text);
+            }
             OutputEvent::Transcript(transcript) => {
                 self.current_transcript.clone_from(&transcript.text);
+                if let Some(turn) = self
+                    .conversation
+                    .iter_mut()
+                    .find(|turn| turn.request_id == transcript.sequence)
+                {
+                    turn.question.clone_from(&transcript.text);
+                } else {
+                    self.conversation.push(ConversationTurn {
+                        request_id: transcript.sequence,
+                        question: transcript.text.clone(),
+                        answer: String::new(),
+                        answer_status: AnswerStatus::Pending,
+                    });
+                }
             }
             OutputEvent::AnswerStarted(meta) => {
                 self.llm_status = WorkerStatus::Working;
                 self.current_answer_id = Some(meta.request_id);
                 self.current_answer.clear();
                 self.last_error = None;
+                if let Some(turn) = self
+                    .conversation
+                    .iter_mut()
+                    .find(|turn| turn.request_id == meta.request_id)
+                {
+                    turn.answer.clear();
+                    turn.answer_status = AnswerStatus::Streaming;
+                }
             }
             OutputEvent::AnswerDelta { request_id, text }
                 if self.current_answer_id == Some(*request_id) =>
             {
                 self.current_answer.push_str(text);
+                if let Some(turn) = self
+                    .conversation
+                    .iter_mut()
+                    .find(|turn| turn.request_id == *request_id)
+                {
+                    turn.answer.push_str(text);
+                }
             }
             OutputEvent::AnswerDelta { .. } => {}
             OutputEvent::AnswerCompleted { request_id }
                 if self.current_answer_id == Some(*request_id) =>
             {
                 self.llm_status = WorkerStatus::Idle;
+                if let Some(turn) = self
+                    .conversation
+                    .iter_mut()
+                    .find(|turn| turn.request_id == *request_id)
+                {
+                    turn.answer_status = AnswerStatus::Completed;
+                }
             }
             OutputEvent::AnswerCompleted { .. } => {}
+            OutputEvent::SttObservation(_) | OutputEvent::AnswerUsage { .. } => {}
             OutputEvent::QueueState(queue) => match queue.queue {
                 QueueKind::Audio => self.audio_queue_len = queue.len,
                 QueueKind::Llm => self.llm_queue_len = queue.len,
@@ -98,7 +159,17 @@ impl AppSnapshot {
                         self.listening = false;
                         self.stt_status = ConnectionStatus::Error;
                     }
-                    OutputComponent::Llm => self.llm_status = WorkerStatus::Error,
+                    OutputComponent::Llm => {
+                        self.llm_status = WorkerStatus::Error;
+                        if let Some(request_id) = self.current_answer_id
+                            && let Some(turn) = self
+                                .conversation
+                                .iter_mut()
+                                .find(|turn| turn.request_id == request_id)
+                        {
+                            turn.answer_status = AnswerStatus::Failed;
+                        }
+                    }
                     OutputComponent::App | OutputComponent::Audio => {}
                 }
             }
@@ -129,6 +200,7 @@ mod tests {
         snapshot.apply(&OutputEvent::Transcript(TranscriptView {
             sequence: 4,
             text: "Что такое ownership?".to_owned(),
+            flush_reason: "test".to_owned(),
         }));
         snapshot.apply(&OutputEvent::AnswerStarted(AnswerMeta {
             request_id: 4,
@@ -158,11 +230,25 @@ mod tests {
             "Ownership управляет временем жизни данных."
         );
         assert_eq!(snapshot.llm_queue_len, 2);
+        assert_eq!(
+            snapshot.conversation,
+            vec![ConversationTurn {
+                request_id: 4,
+                question: "Что такое ownership?".to_owned(),
+                answer: "Ownership управляет временем жизни данных.".to_owned(),
+                answer_status: AnswerStatus::Completed,
+            }]
+        );
     }
 
     #[test]
     fn ignores_stale_answer_delta_and_tracks_provider_error() {
         let mut snapshot = AppSnapshot::default();
+        snapshot.apply(&OutputEvent::Transcript(TranscriptView {
+            sequence: 8,
+            text: "Что такое borrow checker?".to_owned(),
+            flush_reason: "test".to_owned(),
+        }));
         snapshot.apply(&OutputEvent::AnswerStarted(AnswerMeta {
             request_id: 8,
             mode: Mode::Voice,
@@ -185,5 +271,52 @@ mod tests {
                 .map(|error| error.message.as_str()),
             Some("timeout")
         );
+        assert_eq!(snapshot.conversation[0].answer_status, AnswerStatus::Failed);
+    }
+
+    #[test]
+    fn tracks_queued_turns_by_request_id_and_clears_them() {
+        let mut snapshot = AppSnapshot::default();
+        snapshot.apply(&OutputEvent::TranscriptDraft {
+            text: "Черновик".to_owned(),
+        });
+        snapshot.apply(&OutputEvent::Transcript(TranscriptView {
+            sequence: 1,
+            text: "Первый вопрос".to_owned(),
+            flush_reason: "test".to_owned(),
+        }));
+        snapshot.apply(&OutputEvent::Transcript(TranscriptView {
+            sequence: 2,
+            text: "Второй вопрос".to_owned(),
+            flush_reason: "test".to_owned(),
+        }));
+        snapshot.apply(&OutputEvent::AnswerStarted(AnswerMeta {
+            request_id: 1,
+            mode: Mode::Voice,
+        }));
+        snapshot.apply(&OutputEvent::AnswerDelta {
+            request_id: 1,
+            text: "Первый ответ".to_owned(),
+        });
+        snapshot.apply(&OutputEvent::AnswerCompleted { request_id: 1 });
+
+        assert_eq!(snapshot.conversation.len(), 2);
+        assert_eq!(snapshot.conversation[0].answer, "Первый ответ");
+        assert_eq!(
+            snapshot.conversation[0].answer_status,
+            AnswerStatus::Completed
+        );
+        assert_eq!(
+            snapshot.conversation[1].answer_status,
+            AnswerStatus::Pending
+        );
+
+        snapshot.apply(&OutputEvent::Status(StatusMessage {
+            kind: StatusKind::HistoryCleared,
+            text: "cleared".to_owned(),
+        }));
+
+        assert!(snapshot.conversation.is_empty());
+        assert!(snapshot.transcript_draft.is_empty());
     }
 }

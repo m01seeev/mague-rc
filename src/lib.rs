@@ -8,4 +8,5 @@ pub mod llm;
 pub mod output;
 pub mod overlay;
 pub mod stt;
+pub mod telemetry;
 pub mod transcript;

@@ -19,6 +19,8 @@ struct ResultsMessage {
     is_final: bool,
     #[serde(default)]
     speech_final: bool,
+    start: Option<f64>,
+    duration: Option<f64>,
     channel: Channel,
 }
 
@@ -55,14 +57,33 @@ pub fn parse_server_message(message: &str) -> Result<Option<DeepgramEvent>, Prot
                 text,
                 is_final: result.is_final,
                 speech_final: result.speech_final,
+                audio_start_ms: result.start.and_then(seconds_to_ms),
+                audio_duration_ms: result.duration.and_then(seconds_to_ms),
             }))
         }
-        "SpeechStarted" => Ok(Some(DeepgramEvent::SpeechStarted)),
-        "UtteranceEnd" => Ok(Some(DeepgramEvent::UtteranceEnd)),
+        "SpeechStarted" => Ok(Some(DeepgramEvent::SpeechStarted {
+            audio_timestamp_ms: value
+                .get("timestamp")
+                .and_then(Value::as_f64)
+                .and_then(seconds_to_ms),
+        })),
+        "UtteranceEnd" => Ok(Some(DeepgramEvent::UtteranceEnd {
+            last_word_end_ms: value
+                .get("last_word_end")
+                .and_then(Value::as_f64)
+                .and_then(seconds_to_ms),
+        })),
         "Metadata" => Ok(Some(DeepgramEvent::Metadata)),
         "Error" => Ok(Some(DeepgramEvent::Error(error_description(&value)))),
         _ => Ok(None),
     }
+}
+
+fn seconds_to_ms(seconds: f64) -> Option<u64> {
+    if !seconds.is_finite() || seconds.is_sign_negative() {
+        return None;
+    }
+    Some((seconds * 1_000.0).round() as u64)
 }
 
 fn error_description(value: &Value) -> String {
@@ -105,6 +126,8 @@ mod tests {
                 text: "Привет, мир.".to_owned(),
                 is_final: true,
                 speech_final: false,
+                audio_start_ms: None,
+                audio_duration_ms: None,
             }
         );
     }
@@ -132,14 +155,43 @@ mod tests {
     }
 
     #[test]
+    fn parses_transcript_audio_position() {
+        let event = parse_server_message(
+            r#"{
+                "type": "Results",
+                "start": 1.25,
+                "duration": 0.75,
+                "channel": {"alternatives": [{"transcript": "test"}]}
+            }"#,
+        )
+        .expect("message must parse")
+        .expect("event must be produced");
+
+        assert!(matches!(
+            event,
+            DeepgramEvent::Transcript {
+                audio_start_ms: Some(1_250),
+                audio_duration_ms: Some(750),
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn parses_control_events() {
         assert_eq!(
-            parse_server_message(r#"{"type":"SpeechStarted"}"#).expect("message must parse"),
-            Some(DeepgramEvent::SpeechStarted)
+            parse_server_message(r#"{"type":"SpeechStarted","timestamp":0.5}"#)
+                .expect("message must parse"),
+            Some(DeepgramEvent::SpeechStarted {
+                audio_timestamp_ms: Some(500),
+            })
         );
         assert_eq!(
-            parse_server_message(r#"{"type":"UtteranceEnd"}"#).expect("message must parse"),
-            Some(DeepgramEvent::UtteranceEnd)
+            parse_server_message(r#"{"type":"UtteranceEnd","last_word_end":2.5}"#)
+                .expect("message must parse"),
+            Some(DeepgramEvent::UtteranceEnd {
+                last_word_end_ms: Some(2_500),
+            })
         );
         assert_eq!(
             parse_server_message(r#"{"type":"Metadata"}"#).expect("message must parse"),

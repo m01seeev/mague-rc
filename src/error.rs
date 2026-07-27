@@ -43,7 +43,7 @@ pub enum AppError {
     #[error("failed to start overlay: {0}")]
     Overlay(String),
 
-    #[error("unknown argument `{0}`; expected --overlay or --terminal")]
+    #[error("invalid arguments: {0}")]
     Argument(String),
 
     #[error("{worker} worker task failed: {error}")]

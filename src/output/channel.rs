@@ -49,7 +49,12 @@ fn update_stats(stats: &mut OutputStats, event: &OutputEvent) {
         OutputEvent::Error(error) if error.component == crate::events::OutputComponent::Llm => {
             stats.failed += 1;
         }
-        OutputEvent::AnswerDelta { .. } | OutputEvent::QueueState(_) | OutputEvent::Error(_) => {}
+        OutputEvent::SttObservation(_)
+        | OutputEvent::TranscriptDraft { .. }
+        | OutputEvent::AnswerDelta { .. }
+        | OutputEvent::AnswerUsage { .. }
+        | OutputEvent::QueueState(_)
+        | OutputEvent::Error(_) => {}
     }
 }
 

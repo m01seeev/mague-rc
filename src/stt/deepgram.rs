@@ -94,6 +94,7 @@ impl DeepgramSttProvider {
         mut audio: AudioFrameReceiver,
         events: mpsc::UnboundedSender<DeepgramEvent>,
         mut shutdown: watch::Receiver<bool>,
+        mut readiness: Option<watch::Sender<bool>>,
     ) -> Result<(), SttError> {
         let mut retry_frame = None;
         let mut retry_count = 0_u32;
@@ -147,6 +148,9 @@ impl DeepgramSttProvider {
                 queue_len,
                 "Deepgram connected"
             );
+            if let Some(readiness) = readiness.take() {
+                let _ = readiness.send(true);
+            }
             let connected_at = Instant::now();
             let result = run_connection(
                 socket,
@@ -211,6 +215,17 @@ impl DeepgramSttProvider {
             .map(|(socket, _response)| socket)
             .map_err(|error| SttError::Task(format!("WebSocket handshake failed: {error}")))
     }
+
+    pub async fn run_with_readiness(
+        self,
+        audio: AudioFrameReceiver,
+        events: mpsc::UnboundedSender<DeepgramEvent>,
+        shutdown: watch::Receiver<bool>,
+        readiness: watch::Sender<bool>,
+    ) -> Result<(), SttError> {
+        self.run_loop(audio, events, shutdown, Some(readiness))
+            .await
+    }
 }
 
 impl SpeechToTextProvider for DeepgramSttProvider {
@@ -220,7 +235,7 @@ impl SpeechToTextProvider for DeepgramSttProvider {
         events: mpsc::UnboundedSender<DeepgramEvent>,
         shutdown: watch::Receiver<bool>,
     ) -> impl Future<Output = Result<(), SttError>> + Send {
-        self.run_loop(audio, events, shutdown)
+        self.run_loop(audio, events, shutdown, None)
     }
 }
 

@@ -5,7 +5,7 @@ mod terminal;
 
 pub use channel::{ChannelOutputError, ChannelOutputSink};
 pub use sink::OutputSink;
-pub use state::{AppSnapshot, ConnectionStatus, WorkerStatus};
+pub use state::{AnswerStatus, AppSnapshot, ConnectionStatus, ConversationTurn, WorkerStatus};
 pub use terminal::{TerminalOutputError, TerminalOutputSink};
 
 #[derive(Default)]

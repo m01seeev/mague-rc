@@ -4,6 +4,8 @@ use futures_util::Stream;
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::events::LlmUsage;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChatRole {
@@ -46,7 +48,13 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
 }
 
-pub type TextStream = Pin<Box<dyn Stream<Item = Result<String, LlmError>> + Send>>;
+#[derive(Clone, Debug, PartialEq)]
+pub enum LlmStreamEvent {
+    Delta(String),
+    Usage(LlmUsage),
+}
+
+pub type TextStream = Pin<Box<dyn Stream<Item = Result<LlmStreamEvent, LlmError>> + Send>>;
 
 pub trait TextLlmProvider: Send + Sync + 'static {
     fn stream(&self, request: ChatRequest) -> TextStream;

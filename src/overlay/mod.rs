@@ -1,4 +1,9 @@
-use std::{cell::RefCell, rc::Rc, sync::mpsc, thread};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    sync::mpsc,
+    thread,
+};
 
 use futures_util::StreamExt;
 use gtk::{
@@ -14,13 +19,16 @@ use crate::{
     app,
     config::Config,
     events::{AppCommand, AppErrorView, OutputComponent, OutputEvent, StatusKind, StatusMessage},
-    output::{AppSnapshot, ChannelOutputSink, ConnectionStatus, WorkerStatus},
+    output::{
+        AnswerStatus, AppSnapshot, ChannelOutputSink, ConnectionStatus, ConversationTurn,
+        WorkerStatus,
+    },
 };
 
 const APPLICATION_ID: &str = "io.github.mague_rc.Overlay";
 const NAMESPACE: &str = "mague-rc-overlay";
 const WIDTH: i32 = 760;
-const HEIGHT: i32 = 420;
+const HEIGHT: i32 = 600;
 const COLLAPSED_WIDTH: i32 = 420;
 const COLLAPSED_HEIGHT: i32 = 52;
 
@@ -120,12 +128,27 @@ struct OverlayWidgets {
     status_dot: GtkBox,
     status_label: Label,
     pause_icon: Image,
-    question: Label,
-    answer: Label,
+    history: ConversationHistoryWidgets,
     footer: Label,
     queue: Label,
     collapse_icon: Image,
     body: GtkBox,
+}
+
+#[derive(Clone)]
+struct ConversationHistoryWidgets {
+    turns_container: GtkBox,
+    empty: Label,
+    draft_root: GtkBox,
+    draft: Label,
+    turns: Rc<RefCell<Vec<ConversationTurnWidgets>>>,
+}
+
+struct ConversationTurnWidgets {
+    request_id: u64,
+    root: GtkBox,
+    question: Label,
+    answer: Label,
 }
 
 fn build_overlay(application: &Application, config: Config) {
@@ -250,9 +273,7 @@ fn create_widgets(application: &Application, state: Rc<RefCell<OverlayState>>) -
     window.set_layer(Layer::Overlay);
     window.set_keyboard_mode(KeyboardMode::None);
     window.set_anchor(Edge::Top, true);
-    window.set_anchor(Edge::Right, true);
     window.set_margin(Edge::Top, 24);
-    window.set_margin(Edge::Right, 24);
     window.set_exclusive_zone(-1);
 
     let root = GtkBox::new(Orientation::Vertical, 0);
@@ -345,40 +366,40 @@ fn create_widgets(application: &Application, state: Rc<RefCell<OverlayState>>) -
     body.set_vexpand(true);
     root.append(&body);
 
-    let question_section = GtkBox::new(Orientation::Vertical, 6);
-    question_section.add_css_class("section");
-    question_section.set_margin_top(12);
-    question_section.set_margin_bottom(12);
-    question_section.set_margin_start(16);
-    question_section.set_margin_end(16);
+    let history_container = GtkBox::new(Orientation::Vertical, 0);
+    let history_empty = Label::new(Some("Listening for a question"));
+    history_empty.add_css_class("empty-history");
+    history_empty.set_margin_top(32);
+    history_empty.set_margin_bottom(32);
+    history_container.append(&history_empty);
 
-    let question_title = section_title("QUESTION", true);
-    question_section.append(&question_title);
-    let question = content_label("Listening for a question", "question");
-    question_section.append(&question);
-    body.append(&question_section);
-    body.append(&Separator::new(Orientation::Horizontal));
+    let turns_container = GtkBox::new(Orientation::Vertical, 0);
+    history_container.append(&turns_container);
 
-    let answer_section = GtkBox::new(Orientation::Vertical, 8);
-    answer_section.add_css_class("answer-section");
-    answer_section.set_margin_top(12);
-    answer_section.set_margin_start(16);
-    answer_section.set_margin_end(16);
-    answer_section.set_vexpand(true);
-    answer_section.append(&section_title("ANSWER", false));
+    let draft_root = GtkBox::new(Orientation::Vertical, 6);
+    draft_root.add_css_class("transcript-draft");
+    draft_root.set_margin_top(14);
+    draft_root.set_margin_bottom(16);
+    draft_root.set_margin_start(16);
+    draft_root.set_margin_end(16);
+    draft_root.append(&section_title("QUESTION / LIVE", true));
+    let draft = content_label("", "question");
+    draft_root.append(&draft);
+    draft_root.set_visible(false);
+    history_container.append(&draft_root);
 
-    let answer = content_label("Answer will appear here", "answer");
-    let answer_scroll = ScrolledWindow::builder()
+    let history_scroll = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
         .vexpand(true)
-        .child(&answer)
+        .child(&history_container)
         .build();
-    answer_section.append(&answer_scroll);
-    body.append(&answer_section);
+    configure_follow_tail(&history_scroll);
+    body.append(&history_scroll);
 
     let footer_row = GtkBox::new(Orientation::Horizontal, 8);
     footer_row.add_css_class("footer");
+    footer_row.set_margin_top(10);
     footer_row.set_margin_start(16);
     footer_row.set_margin_end(16);
     footer_row.set_margin_bottom(13);
@@ -400,8 +421,13 @@ fn create_widgets(application: &Application, state: Rc<RefCell<OverlayState>>) -
         status_dot,
         status_label: status_label.clone(),
         pause_icon,
-        question,
-        answer,
+        history: ConversationHistoryWidgets {
+            turns_container,
+            empty: history_empty,
+            draft_root,
+            draft,
+            turns: Rc::new(RefCell::new(Vec::new())),
+        },
         footer,
         queue,
         collapse_icon,
@@ -483,6 +509,146 @@ fn content_label(value: &str, css_class: &str) -> Label {
     label
 }
 
+fn create_conversation_turn(turn: &ConversationTurn) -> ConversationTurnWidgets {
+    let root = GtkBox::new(Orientation::Vertical, 0);
+    root.add_css_class("conversation-turn");
+
+    let question_section = GtkBox::new(Orientation::Vertical, 6);
+    question_section.set_margin_top(14);
+    question_section.set_margin_bottom(12);
+    question_section.set_margin_start(16);
+    question_section.set_margin_end(16);
+    question_section.append(&section_title("QUESTION", true));
+
+    let question = content_label(&turn.question, "question");
+    question_section.append(&question);
+    root.append(&question_section);
+
+    let answer_section = GtkBox::new(Orientation::Vertical, 8);
+    answer_section.set_margin_bottom(16);
+    answer_section.set_margin_start(16);
+    answer_section.set_margin_end(16);
+    answer_section.append(&section_title("ANSWER", false));
+
+    let answer = content_label("", "answer");
+    update_answer(&answer, turn);
+    answer_section.append(&answer);
+    root.append(&answer_section);
+    root.append(&Separator::new(Orientation::Horizontal));
+
+    ConversationTurnWidgets {
+        request_id: turn.request_id,
+        root,
+        question,
+        answer,
+    }
+}
+
+fn refresh_conversation_history(
+    conversation: &[ConversationTurn],
+    history: &ConversationHistoryWidgets,
+) {
+    let mut turns = history.turns.borrow_mut();
+
+    let needs_rebuild = turns.len() > conversation.len()
+        || turns
+            .iter()
+            .zip(conversation)
+            .any(|(widgets, turn)| widgets.request_id != turn.request_id);
+    if needs_rebuild {
+        for turn in turns.drain(..) {
+            history.turns_container.remove(&turn.root);
+        }
+    }
+
+    for turn in conversation.iter().skip(turns.len()) {
+        let widgets = create_conversation_turn(turn);
+        history.turns_container.append(&widgets.root);
+        turns.push(widgets);
+    }
+
+    for (widgets, turn) in turns.iter().zip(conversation) {
+        if widgets.question.text() != turn.question {
+            widgets.question.set_text(&turn.question);
+        }
+        update_answer(&widgets.answer, turn);
+    }
+
+    history
+        .empty
+        .set_visible(conversation.is_empty() && history.draft.text().is_empty());
+}
+
+fn refresh_transcript_draft(text: &str, history: &ConversationHistoryWidgets) {
+    history.draft.set_text(text);
+    history.draft_root.set_visible(!text.is_empty());
+    history
+        .empty
+        .set_visible(history.turns.borrow().is_empty() && text.is_empty());
+}
+
+fn configure_follow_tail(scroll: &ScrolledWindow) {
+    let adjustment = scroll.vadjustment();
+    let follow_tail = Rc::new(Cell::new(true));
+
+    adjustment.connect_value_changed({
+        let follow_tail = Rc::clone(&follow_tail);
+        move |adjustment| follow_tail.set(adjustment_is_at_bottom(adjustment))
+    });
+    adjustment.connect_changed(move |adjustment| {
+        if follow_tail.get() {
+            scroll_adjustment_to_bottom(adjustment);
+        }
+    });
+}
+
+fn adjustment_is_at_bottom(adjustment: &gtk::Adjustment) -> bool {
+    scroll_position_is_at_bottom(
+        adjustment.value(),
+        adjustment.page_size(),
+        adjustment.upper(),
+    )
+}
+
+fn scroll_position_is_at_bottom(value: f64, page_size: f64, upper: f64) -> bool {
+    value + page_size >= upper - 12.0
+}
+
+fn scroll_adjustment_to_bottom(adjustment: &gtk::Adjustment) {
+    let target = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+    adjustment.set_value(target);
+}
+
+fn update_answer(label: &Label, turn: &ConversationTurn) -> bool {
+    let text = if turn.answer.is_empty() {
+        match turn.answer_status {
+            AnswerStatus::Pending => "Waiting for answer",
+            AnswerStatus::Streaming => "Thinking...",
+            AnswerStatus::Completed => "No answer returned",
+            AnswerStatus::Failed => "Answer failed",
+        }
+    } else {
+        &turn.answer
+    };
+    let changed = label.text() != text;
+    if changed {
+        label.set_text(text);
+    }
+
+    label.remove_css_class("answer-placeholder");
+    label.remove_css_class("answer-error");
+    if turn.answer.is_empty() {
+        match turn.answer_status {
+            AnswerStatus::Failed => label.add_css_class("answer-error"),
+            AnswerStatus::Pending | AnswerStatus::Streaming | AnswerStatus::Completed => {
+                label.add_css_class("answer-placeholder");
+            }
+        }
+    }
+
+    changed
+}
+
 fn refresh_widgets(state: &OverlayState, widgets: &OverlayWidgets) {
     widgets.status_label.set_text(&state.status);
     widgets.pause_icon.set_icon_name(Some(if state.paused {
@@ -501,23 +667,8 @@ fn refresh_widgets(state: &OverlayState, widgets: &OverlayWidgets) {
     }
     widgets.status_dot.add_css_class(status_css_class(state));
 
-    let question = if state.snapshot.current_transcript.is_empty() {
-        "Listening for a question"
-    } else {
-        &state.snapshot.current_transcript
-    };
-    widgets.question.set_text(question);
-
-    let answer = if state.snapshot.current_answer.is_empty() {
-        if state.snapshot.llm_status == WorkerStatus::Working {
-            "Thinking"
-        } else {
-            "Answer will appear here"
-        }
-    } else {
-        &state.snapshot.current_answer
-    };
-    widgets.answer.set_text(answer);
+    refresh_conversation_history(&state.snapshot.conversation, &widgets.history);
+    refresh_transcript_draft(&state.snapshot.transcript_draft, &widgets.history);
 
     widgets.footer.set_text(&status_detail(state));
     let has_queue = state.snapshot.audio_queue_len > 0 || state.snapshot.llm_queue_len > 0;
@@ -586,7 +737,7 @@ fn install_css() {
         }
 
         .panel {
-            background: rgba(14, 15, 17, 0.96);
+            background: rgba(14, 15, 17, 0.90);
             color: #edf0f2;
             border: 1px solid #383d45;
             border-radius: 8px;
@@ -665,6 +816,20 @@ fn install_css() {
             font-size: 16px;
         }
 
+        .answer-placeholder,
+        .empty-history {
+            color: #777f89;
+        }
+
+        .answer-error {
+            color: #ef595c;
+        }
+
+        .empty-history {
+            font-family: "Noto Sans", sans-serif;
+            font-size: 14px;
+        }
+
         scrolledwindow,
         scrolledwindow viewport {
             background: transparent;
@@ -708,11 +873,17 @@ mod tests {
         state.apply_output(&OutputEvent::Transcript(crate::events::TranscriptView {
             sequence: 1,
             text: String::from("What is ownership?"),
+            flush_reason: String::from("test"),
         }));
 
         assert_eq!(state.status, "Listening");
         assert!(state.snapshot.listening);
         assert_eq!(state.snapshot.current_transcript, "What is ownership?");
+        assert_eq!(state.snapshot.conversation.len(), 1);
+        assert_eq!(
+            state.snapshot.conversation[0].question,
+            "What is ownership?"
+        );
     }
 
     #[test]
@@ -722,5 +893,25 @@ mod tests {
             kind: StatusKind::Stopped,
             text: String::from("stopped"),
         })));
+    }
+
+    #[test]
+    fn applies_live_transcript_draft_to_overlay_state() {
+        let mut state = state();
+        state.apply_output(&OutputEvent::TranscriptDraft {
+            text: "Как работает".to_owned(),
+        });
+        state.apply_output(&OutputEvent::TranscriptDraft {
+            text: "Как работает HashMap?".to_owned(),
+        });
+
+        assert_eq!(state.snapshot.transcript_draft, "Как работает HashMap?");
+    }
+
+    #[test]
+    fn detects_when_scroll_position_is_at_the_bottom() {
+        assert!(scroll_position_is_at_bottom(80.0, 20.0, 100.0));
+        assert!(scroll_position_is_at_bottom(69.0, 20.0, 100.0));
+        assert!(!scroll_position_is_at_bottom(60.0, 20.0, 100.0));
     }
 }

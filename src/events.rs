@@ -13,9 +13,15 @@ pub enum DeepgramEvent {
         text: String,
         is_final: bool,
         speech_final: bool,
+        audio_start_ms: Option<u64>,
+        audio_duration_ms: Option<u64>,
     },
-    SpeechStarted,
-    UtteranceEnd,
+    SpeechStarted {
+        audio_timestamp_ms: Option<u64>,
+    },
+    UtteranceEnd {
+        last_word_end_ms: Option<u64>,
+    },
     Metadata,
     Error(String),
 }
@@ -85,6 +91,32 @@ pub struct StatusMessage {
 pub struct TranscriptView {
     pub sequence: u64,
     pub text: String,
+    pub flush_reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SttObservation {
+    Transcript {
+        text: String,
+        is_final: bool,
+        speech_final: bool,
+        audio_start_ms: Option<u64>,
+        audio_duration_ms: Option<u64>,
+    },
+    SpeechStarted {
+        audio_timestamp_ms: Option<u64>,
+    },
+    UtteranceEnd {
+        last_word_end_ms: Option<u64>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LlmUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub cost: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,12 +171,15 @@ pub struct AppErrorView {
     pub message: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum OutputEvent {
     Status(StatusMessage),
+    SttObservation(SttObservation),
+    TranscriptDraft { text: String },
     Transcript(TranscriptView),
     AnswerStarted(AnswerMeta),
     AnswerDelta { request_id: u64, text: String },
+    AnswerUsage { request_id: u64, usage: LlmUsage },
     AnswerCompleted { request_id: u64 },
     QueueState(QueueState),
     Error(AppErrorView),
