@@ -110,12 +110,24 @@ pub struct TranscriptConfig {
 #[derive(Clone, Debug)]
 pub struct KnowledgeConfig {
     pub enabled: bool,
+    pub embedding: EmbeddingConfig,
     pub top_k: usize,
     pub max_context_chars: usize,
     pub min_score: f32,
     pub refresh_ms: u64,
     pub final_wait_ms: u64,
     pub debug: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct EmbeddingConfig {
+    pub api_key: SecretString,
+    pub base_url: Url,
+    pub model: String,
+    pub dimensions: usize,
+    pub query_input_type: String,
+    pub document_input_type: String,
+    pub timeout_sec: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -141,13 +153,19 @@ pub enum ConfigError {
 
 impl Config {
     pub fn load() -> Result<Self, ConfigError> {
-        if Path::new(".env").exists() {
-            dotenvy::from_path(".env")?;
-        }
-
+        load_dotenv()?;
         let values = env::vars().collect::<HashMap<_, _>>();
         let config = Self::from_values(&values)?;
         config.validate_ffmpeg_launch()?;
+        Ok(config)
+    }
+
+    pub fn load_embedding() -> Result<EmbeddingConfig, ConfigError> {
+        load_dotenv()?;
+        let values = env::vars().collect::<HashMap<_, _>>();
+        let reader = ConfigReader::new(&values);
+        let config = embedding_config(&reader)?;
+        validate_embedding(&config)?;
         Ok(config)
     }
 
@@ -204,11 +222,12 @@ impl Config {
             },
             knowledge: KnowledgeConfig {
                 enabled: reader.boolean("RAG_ENABLED", true)?,
+                embedding: embedding_config(&reader)?,
                 top_k: reader.parse("RAG_TOP_K", 3)?,
                 max_context_chars: reader.parse("RAG_MAX_CONTEXT_CHARS", 4_200)?,
-                min_score: reader.parse("RAG_MIN_SCORE", 0.75)?,
+                min_score: reader.parse("RAG_MIN_SCORE", 0.48)?,
                 refresh_ms: reader.parse("RAG_REFRESH_MS", 1_000)?,
-                final_wait_ms: reader.parse("RAG_FINAL_WAIT_MS", 80)?,
+                final_wait_ms: reader.parse("RAG_FINAL_WAIT_MS", 650)?,
                 debug: reader.boolean("RAG_DEBUG", false)?,
             },
             screenshot: ScreenshotConfig {
@@ -279,6 +298,7 @@ impl Config {
         positive("MIN_UTTERANCE_CHARS", self.transcript.min_utterance_chars)?;
 
         positive("RAG_TOP_K", self.knowledge.top_k)?;
+        validate_embedding(&self.knowledge.embedding)?;
         positive("RAG_MAX_CONTEXT_CHARS", self.knowledge.max_context_chars)?;
         finite_range("RAG_MIN_SCORE", self.knowledge.min_score, 0.0, 2.0)?;
         positive("RAG_REFRESH_MS", self.knowledge.refresh_ms)?;
@@ -317,6 +337,46 @@ impl Config {
 
         Ok(())
     }
+}
+
+fn load_dotenv() -> Result<(), ConfigError> {
+    if Path::new(".env").exists() {
+        dotenvy::from_path(".env")?;
+    }
+    Ok(())
+}
+
+fn embedding_config(reader: &ConfigReader<'_>) -> Result<EmbeddingConfig, ConfigError> {
+    let model = reader.string("RAG_EMBEDDING_MODEL", "nvidia/nemotron-3-embed-1b:free");
+    let (default_query_type, default_document_type) = if model.contains("nemotron") {
+        ("query", "passage")
+    } else {
+        ("search_query", "search_document")
+    };
+    Ok(EmbeddingConfig {
+        api_key: SecretString::new(reader.required("OPENROUTER_API_KEY")?),
+        base_url: reader.url("OPENROUTER_BASE_URL", DEFAULT_OPENROUTER_BASE_URL)?,
+        model,
+        dimensions: reader.parse("RAG_EMBEDDING_DIMENSIONS", 2_048)?,
+        query_input_type: reader.string("RAG_EMBEDDING_QUERY_INPUT_TYPE", default_query_type),
+        document_input_type: reader
+            .string("RAG_EMBEDDING_DOCUMENT_INPUT_TYPE", default_document_type),
+        timeout_sec: reader.parse("RAG_EMBEDDING_TIMEOUT_SEC", 30)?,
+    })
+}
+
+fn validate_embedding(config: &EmbeddingConfig) -> Result<(), ConfigError> {
+    non_empty_secret("OPENROUTER_API_KEY", &config.api_key)?;
+    validate_url_scheme("OPENROUTER_BASE_URL", &config.base_url, &["http", "https"])?;
+    non_empty("RAG_EMBEDDING_MODEL", &config.model)?;
+    in_range("RAG_EMBEDDING_DIMENSIONS", config.dimensions, 32, 4_096)?;
+    non_empty("RAG_EMBEDDING_QUERY_INPUT_TYPE", &config.query_input_type)?;
+    non_empty(
+        "RAG_EMBEDDING_DOCUMENT_INPUT_TYPE",
+        &config.document_input_type,
+    )?;
+    positive("RAG_EMBEDDING_TIMEOUT_SEC", config.timeout_sec)?;
+    Ok(())
 }
 
 struct ConfigReader<'a> {
@@ -532,6 +592,13 @@ mod tests {
         assert_eq!(config.transcript.window_sec, 5);
         assert_eq!(config.llm.max_history_pairs, 4);
         assert_eq!(config.knowledge.top_k, 3);
+        assert_eq!(
+            config.knowledge.embedding.model,
+            "nvidia/nemotron-3-embed-1b:free"
+        );
+        assert_eq!(config.knowledge.embedding.dimensions, 2_048);
+        assert_eq!(config.knowledge.embedding.query_input_type, "query");
+        assert_eq!(config.knowledge.embedding.document_input_type, "passage");
         assert!(config.screenshot.enabled);
     }
 

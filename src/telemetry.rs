@@ -18,7 +18,7 @@ use crate::{
     output::{OutputSink, OutputStats},
 };
 
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 7;
 
 #[derive(Debug, Error)]
 pub enum TelemetryError {
@@ -248,6 +248,9 @@ impl TelemetryRecorder {
                     .or_default()
                     .retrieval = Some(RetrievalMetrics {
                     searches: context.searches,
+                    embedding_calls: context.embedding_calls,
+                    embedding_prompt_tokens: context.embedding_prompt_tokens,
+                    embedding_total_tokens: context.embedding_total_tokens,
                     snippets: context.snippets.len(),
                     context_chars: context
                         .snippets
@@ -272,6 +275,9 @@ impl TelemetryRecorder {
                     Some(retrieval.request_id),
                     json!({
                         "searches": context.searches,
+                        "embedding_calls": context.embedding_calls,
+                        "embedding_prompt_tokens": context.embedding_prompt_tokens,
+                        "embedding_total_tokens": context.embedding_total_tokens,
                         "snippets": context.snippets.len(),
                         "context_chars": context
                             .snippets
@@ -693,6 +699,12 @@ struct ConfigurationSnapshot {
     temperature: f32,
     max_tokens: u32,
     rag_enabled: bool,
+    rag_embedding_provider: &'static str,
+    rag_embedding_model: String,
+    rag_embedding_dimensions: usize,
+    rag_embedding_query_input_type: String,
+    rag_embedding_document_input_type: String,
+    rag_embedding_timeout_sec: u64,
     rag_top_k: usize,
     rag_max_context_chars: usize,
     rag_min_score: f32,
@@ -723,6 +735,16 @@ impl From<&Config> for ConfigurationSnapshot {
             temperature: config.llm.temperature,
             max_tokens: config.llm.max_tokens,
             rag_enabled: config.knowledge.enabled,
+            rag_embedding_provider: "openrouter",
+            rag_embedding_model: config.knowledge.embedding.model.clone(),
+            rag_embedding_dimensions: config.knowledge.embedding.dimensions,
+            rag_embedding_query_input_type: config.knowledge.embedding.query_input_type.clone(),
+            rag_embedding_document_input_type: config
+                .knowledge
+                .embedding
+                .document_input_type
+                .clone(),
+            rag_embedding_timeout_sec: config.knowledge.embedding.timeout_sec,
             rag_top_k: config.knowledge.top_k,
             rag_max_context_chars: config.knowledge.max_context_chars,
             rag_min_score: config.knowledge.min_score,
@@ -757,6 +779,9 @@ struct RequestMetrics {
 #[derive(Serialize)]
 struct RetrievalMetrics {
     searches: u64,
+    embedding_calls: u64,
+    embedding_prompt_tokens: u64,
+    embedding_total_tokens: u64,
     snippets: usize,
     context_chars: usize,
     embedding_ms: u64,
@@ -900,6 +925,9 @@ struct AggregateSummary {
     total_cost: f64,
     rag_request_count: usize,
     rag_searches: u64,
+    rag_embedding_calls: u64,
+    rag_embedding_prompt_tokens: u64,
+    rag_embedding_total_tokens: u64,
     rag_snippets: usize,
     rag_context_chars: usize,
     build_ms: MetricSummary,
@@ -942,6 +970,18 @@ impl AggregateSummary {
             total_cost: usage.iter().filter_map(|usage| usage.cost).sum(),
             rag_request_count: retrieval.len(),
             rag_searches: retrieval.iter().map(|retrieval| retrieval.searches).sum(),
+            rag_embedding_calls: retrieval
+                .iter()
+                .map(|retrieval| retrieval.embedding_calls)
+                .sum(),
+            rag_embedding_prompt_tokens: retrieval
+                .iter()
+                .map(|retrieval| retrieval.embedding_prompt_tokens)
+                .sum(),
+            rag_embedding_total_tokens: retrieval
+                .iter()
+                .map(|retrieval| retrieval.embedding_total_tokens)
+                .sum(),
             rag_snippets: retrieval.iter().map(|retrieval| retrieval.snippets).sum(),
             rag_context_chars: retrieval
                 .iter()
@@ -1370,8 +1410,8 @@ mod tests {
     use super::*;
     use crate::{
         config::{
-            AudioConfig, DeepgramConfig, KnowledgeConfig, LlmConfig, ScreenshotConfig,
-            SecretString, TranscriptConfig, VisionConfig,
+            AudioConfig, DeepgramConfig, EmbeddingConfig, KnowledgeConfig, LlmConfig,
+            ScreenshotConfig, SecretString, TranscriptConfig, VisionConfig,
         },
         events::{
             AnswerMeta, KnowledgeContext, KnowledgeSnippet, Mode, RetrievalView, TranscriptView,
@@ -1464,6 +1504,9 @@ mod tests {
                         score: 0.91,
                     }],
                     searches: 2,
+                    embedding_calls: 2,
+                    embedding_prompt_tokens: 24,
+                    embedding_total_tokens: 24,
                     embedding_ms: 16,
                     search_ms: 2,
                     final_wait_ms: 7,
@@ -1629,6 +1672,15 @@ mod tests {
             },
             knowledge: KnowledgeConfig {
                 enabled: false,
+                embedding: EmbeddingConfig {
+                    api_key: SecretString::new("openrouter-secret".to_owned()),
+                    base_url: Url::parse("https://example.test/api/v1").expect("URL must parse"),
+                    model: "test-embedding".to_owned(),
+                    dimensions: 1_024,
+                    query_input_type: "search_query".to_owned(),
+                    document_input_type: "search_document".to_owned(),
+                    timeout_sec: 30,
+                },
                 top_k: 3,
                 max_context_chars: 4_200,
                 min_score: 0.75,

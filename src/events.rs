@@ -86,6 +86,9 @@ pub struct KnowledgeSnippet {
 pub struct KnowledgeContext {
     pub snippets: Vec<KnowledgeSnippet>,
     pub searches: u64,
+    pub embedding_calls: u64,
+    pub embedding_prompt_tokens: u64,
+    pub embedding_total_tokens: u64,
     pub embedding_ms: u64,
     pub search_ms: u64,
     pub final_wait_ms: u64,

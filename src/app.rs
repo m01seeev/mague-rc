@@ -1,6 +1,4 @@
-use std::{
-    collections::HashMap, path::PathBuf, thread::JoinHandle as ThreadJoinHandle, time::Duration,
-};
+use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 use thiserror::Error;
 use tokio::{
@@ -104,8 +102,8 @@ where
         }),
     )?;
 
-    let (retrieval, knowledge_thread) = if config.knowledge.enabled {
-        match spawn_knowledge_worker() {
+    let (retrieval, knowledge_task) = if config.knowledge.enabled {
+        match spawn_knowledge_worker(config.knowledge.embedding.clone()) {
             Ok(runtime) => (
                 Some(RetrievalPipeline::new(
                     config.knowledge.clone(),
@@ -113,14 +111,14 @@ where
                     runtime.results,
                     runtime.readiness,
                 )),
-                Some(runtime.thread),
+                Some(runtime.task),
             ),
             Err(error) => {
                 warn!(
                     module = "knowledge",
                     event = "disabled",
                     error = %error,
-                    "local knowledge retrieval disabled"
+                    "remote knowledge retrieval disabled"
                 );
                 send_output(
                     &output_sender,
@@ -330,7 +328,7 @@ where
         shutdown_timeout,
     )
     .await?;
-    let knowledge_stats = finish_knowledge_thread(knowledge_thread).await;
+    let knowledge_stats = finish_knowledge_task(knowledge_task).await;
     let llm_stats = finish_task("LLM", &mut llm_task, llm_completed, shutdown_timeout).await?;
     if output_sender
         .send(OutputEvent::Status(StatusMessage {
@@ -372,6 +370,7 @@ where
         transcript_chunks = transcript_stats.chunks,
         knowledge_searches = knowledge_stats.searches,
         knowledge_failed = knowledge_stats.failed,
+        knowledge_coalesced = knowledge_stats.coalesced,
         llm_requests = llm_stats.requests,
         llm_completed = llm_stats.completed,
         llm_failed = llm_stats.failed,
@@ -426,10 +425,15 @@ struct RetrievalPipeline {
     accumulated: HashMap<String, KnowledgeSnippet>,
     completed: HashMap<u64, Vec<String>>,
     searches: u64,
+    embedding_calls: u64,
+    embedding_prompt_tokens: u64,
+    embedding_total_tokens: u64,
     embedding_ms: u64,
     search_ms: u64,
     last_error: Option<String>,
 }
+
+const ACCUMULATED_SCORE_MARGIN: f32 = 0.08;
 
 impl RetrievalPipeline {
     fn new(
@@ -451,6 +455,9 @@ impl RetrievalPipeline {
             accumulated: HashMap::new(),
             completed: HashMap::new(),
             searches: 0,
+            embedding_calls: 0,
+            embedding_prompt_tokens: 0,
+            embedding_total_tokens: 0,
             embedding_ms: 0,
             search_ms: 0,
             last_error: None,
@@ -486,7 +493,7 @@ impl RetrievalPipeline {
         self.dispatch(query);
     }
 
-    async fn resolve(&mut self, query: &str) -> Result<Option<KnowledgeContext>, String> {
+    async fn resolve(&mut self, query: &str) -> Result<KnowledgeContext, String> {
         self.drain_ready();
         let query = query.trim();
         let search_id = if query == self.last_query {
@@ -530,7 +537,9 @@ impl RetrievalPipeline {
         let mut remaining = self.accumulated.values().collect::<Vec<_>>();
         remaining.sort_by(|left, right| right.score.total_cmp(&left.score));
         for snippet in remaining {
-            if !ordered_ids.contains(&snippet.id) {
+            if snippet.score >= self.config.min_score + ACCUMULATED_SCORE_MARGIN
+                && !ordered_ids.contains(&snippet.id)
+            {
                 ordered_ids.push(snippet.id.clone());
             }
         }
@@ -553,20 +562,22 @@ impl RetrievalPipeline {
             snippets.push(snippet);
         }
 
-        if snippets.is_empty() {
-            if let Some(error) = self.last_error.take() {
-                return Err(error);
-            }
-            return Ok(None);
+        if snippets.is_empty()
+            && let Some(error) = self.last_error.take()
+        {
+            return Err(error);
         }
 
-        Ok(Some(KnowledgeContext {
+        Ok(KnowledgeContext {
             snippets,
             searches: self.searches,
+            embedding_calls: self.embedding_calls,
+            embedding_prompt_tokens: self.embedding_prompt_tokens,
+            embedding_total_tokens: self.embedding_total_tokens,
             embedding_ms: self.embedding_ms,
             search_ms: self.search_ms,
             final_wait_ms,
-        }))
+        })
     }
 
     fn dispatch(&mut self, query: &str) -> Option<u64> {
@@ -601,6 +612,9 @@ impl RetrievalPipeline {
         }
         match result.report {
             Ok(report) => {
+                self.embedding_calls += report.embedding_calls;
+                self.embedding_prompt_tokens += report.prompt_tokens;
+                self.embedding_total_tokens += report.total_tokens;
                 self.embedding_ms += report.embedding.as_millis() as u64;
                 self.search_ms += report.search.as_millis() as u64;
                 let mut ids = Vec::new();
@@ -635,7 +649,7 @@ impl RetrievalPipeline {
                         turn_id = result.turn_id,
                         query = %result.query,
                         hits = self.completed[&result.search_id].len(),
-                        "local knowledge prefetch completed"
+                        "remote knowledge prefetch completed"
                     );
                 }
             }
@@ -651,6 +665,9 @@ impl RetrievalPipeline {
         self.accumulated.clear();
         self.completed.clear();
         self.searches = 0;
+        self.embedding_calls = 0;
+        self.embedding_prompt_tokens = 0;
+        self.embedding_total_tokens = 0;
         self.embedding_ms = 0;
         self.search_ms = 0;
         self.last_error = None;
@@ -1312,27 +1329,27 @@ async fn queue_transcript_chunk(
     let knowledge = if let Some(retrieval) = retrieval.as_mut() {
         match retrieval.resolve(&chunk.text).await {
             Ok(context) => {
-                if let Some(context) = context.as_ref() {
-                    info!(
-                        module = "knowledge",
-                        event = "context_attached",
+                info!(
+                    module = "knowledge",
+                    event = "retrieval_completed",
+                    request_id,
+                    searches = context.searches,
+                    embedding_calls = context.embedding_calls,
+                    embedding_tokens = context.embedding_total_tokens,
+                    snippets = context.snippets.len(),
+                    embedding_ms = context.embedding_ms,
+                    search_ms = context.search_ms,
+                    final_wait_ms = context.final_wait_ms,
+                    "knowledge retrieval completed"
+                );
+                send_output(
+                    output,
+                    OutputEvent::Retrieval(RetrievalView {
                         request_id,
-                        searches = context.searches,
-                        snippets = context.snippets.len(),
-                        embedding_ms = context.embedding_ms,
-                        search_ms = context.search_ms,
-                        final_wait_ms = context.final_wait_ms,
-                        "local knowledge context attached"
-                    );
-                    send_output(
-                        output,
-                        OutputEvent::Retrieval(RetrievalView {
-                            request_id,
-                            context: context.clone(),
-                        }),
-                    )?;
-                }
-                context
+                        context: context.clone(),
+                    }),
+                )?;
+                (!context.snippets.is_empty()).then_some(context)
             }
             Err(error) => {
                 warn!(
@@ -1340,7 +1357,7 @@ async fn queue_transcript_chunk(
                     event = "search_failed",
                     request_id,
                     error = %error,
-                    "local knowledge search failed"
+                    "knowledge retrieval failed"
                 );
                 send_output(
                     output,
@@ -1435,37 +1452,25 @@ async fn wait_for_transcript_readiness(
     }
 }
 
-async fn finish_knowledge_thread(
-    thread: Option<
-        ThreadJoinHandle<Result<KnowledgeWorkerStats, crate::knowledge::KnowledgeError>>,
-    >,
+async fn finish_knowledge_task(
+    task: Option<JoinHandle<Result<KnowledgeWorkerStats, crate::knowledge::KnowledgeError>>>,
 ) -> KnowledgeWorkerStats {
-    let Some(thread) = thread else {
+    let Some(task) = task else {
         return KnowledgeWorkerStats::default();
     };
-    match tokio::task::spawn_blocking(move || thread.join()).await {
-        Ok(Ok(Ok(stats))) => stats,
-        Ok(Ok(Err(error))) => {
+    match task.await {
+        Ok(Ok(stats)) => stats,
+        Ok(Err(error)) => {
             warn!(
                 module = "knowledge",
                 event = "worker_failed",
                 error = %error,
-                "local knowledge worker failed"
+                "remote knowledge worker failed"
             );
             KnowledgeWorkerStats {
                 searches: 0,
                 failed: 1,
-            }
-        }
-        Ok(Err(_)) => {
-            warn!(
-                module = "knowledge",
-                event = "worker_panicked",
-                "local knowledge worker panicked"
-            );
-            KnowledgeWorkerStats {
-                searches: 0,
-                failed: 1,
+                coalesced: 0,
             }
         }
         Err(error) => {
@@ -1473,11 +1478,12 @@ async fn finish_knowledge_thread(
                 module = "knowledge",
                 event = "worker_join_failed",
                 error = %error,
-                "could not join local knowledge worker"
+                "could not join remote knowledge worker"
             );
             KnowledgeWorkerStats {
                 searches: 0,
                 failed: 1,
+                coalesced: 0,
             }
         }
     }
@@ -2136,6 +2142,16 @@ mod tests {
         let mut retrieval = RetrievalPipeline::new(
             KnowledgeConfig {
                 enabled: true,
+                embedding: crate::config::EmbeddingConfig {
+                    api_key: crate::config::SecretString::new("test".to_owned()),
+                    base_url: url::Url::parse("https://example.test/api/v1")
+                        .expect("URL must parse"),
+                    model: "test-embedding".to_owned(),
+                    dimensions: 1_024,
+                    query_input_type: "search_query".to_owned(),
+                    document_input_type: "search_document".to_owned(),
+                    timeout_sec: 30,
+                },
                 top_k: 2,
                 max_context_chars: 2_000,
                 min_score: 0.75,
@@ -2159,7 +2175,7 @@ mod tests {
                     "old",
                     "Общие сведения",
                     "Старый interim-фрагмент",
-                    0.80,
+                    0.86,
                 )),
             })
             .expect("first result must send");
@@ -2187,8 +2203,7 @@ mod tests {
         let context = retrieval
             .resolve(final_query)
             .await
-            .expect("retrieval must succeed")
-            .expect("context must be selected");
+            .expect("retrieval must succeed");
 
         assert_eq!(context.searches, 2);
         assert_eq!(context.snippets.len(), 2);
@@ -2203,8 +2218,10 @@ mod tests {
         score: f32,
     ) -> crate::knowledge::QueryReport {
         crate::knowledge::QueryReport {
-            model_load: Duration::ZERO,
             embedding: Duration::from_millis(8),
+            embedding_calls: 1,
+            prompt_tokens: 4,
+            total_tokens: 4,
             search: Duration::from_millis(1),
             hits: vec![crate::knowledge::SearchHit {
                 id: id.to_owned(),

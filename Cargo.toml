@@ -7,10 +7,6 @@ edition = "2024"
 async-stream = "0.3.6"
 dotenvy = "0.15.7"
 eventsource-stream = "0.2.3"
-fastembed = { version = "5.17.3", default-features = false, features = [
-    "hf-hub-rustls-tls",
-    "ort-download-binaries-rustls-tls",
-] }
 futures-channel = "0.3.31"
 futures-util = "0.3.31"
 pulldown-cmark = "0.13.0"

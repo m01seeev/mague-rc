@@ -2,22 +2,29 @@ use std::{
     collections::HashSet,
     env, fs, io,
     path::{Path, PathBuf},
-    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
-use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::{mpsc, watch};
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinHandle,
+};
 use tracing::info;
 
-const SCHEMA_VERSION: u32 = 1;
-const MODEL_NAME: &str = "intfloat/multilingual-e5-small";
+use crate::config::EmbeddingConfig;
+
+mod openrouter;
+
+use openrouter::{EmbeddingPurpose, OpenRouterEmbeddingClient};
+
+const SCHEMA_VERSION: u32 = 3;
 const MAX_CHUNK_CHARS: usize = 1_200;
 const EMBEDDING_BATCH_SIZE: usize = 32;
 const LEXICAL_WEIGHT: f32 = 0.08;
+const QUERY_INSTRUCTION: &str = "Given a partial or complete Russian spoken technical interview question about Java backend engineering, retrieve the most relevant passages from a personal knowledge base. The knowledge base may contain Russian text, English technical terms, code identifiers, and employment experience.";
 
 #[derive(Debug, Error)]
 pub enum KnowledgeError {
@@ -38,8 +45,20 @@ pub enum KnowledgeError {
     #[error("knowledge query must not be empty")]
     EmptyQuery,
 
-    #[error("local embedding model failed: {0}")]
-    Embedding(String),
+    #[error("could not build OpenRouter embedding client: {0}")]
+    EmbeddingClient(String),
+
+    #[error("OpenRouter embedding request failed: {0}")]
+    EmbeddingRequest(String),
+
+    #[error("OpenRouter embeddings returned HTTP {status}: {message}")]
+    EmbeddingHttpStatus { status: u16, message: String },
+
+    #[error("could not parse OpenRouter embedding response: {0}")]
+    EmbeddingProtocol(String),
+
+    #[error("embedding dimension mismatch: expected {expected}, received {actual}")]
+    EmbeddingDimension { expected: usize, actual: usize },
 
     #[error("could not encode knowledge index: {0}")]
     Encode(#[source] serde_json::Error),
@@ -56,15 +75,10 @@ pub enum KnowledgeError {
 
     #[error("knowledge index is incompatible: {0}; rebuild it with `rag index`")]
     IncompatibleIndex(String),
-
-    #[error("could not start knowledge worker thread: {0}")]
-    WorkerStart(#[source] io::Error),
 }
 
 #[derive(Clone, Debug)]
 pub struct KnowledgePaths {
-    pub root: PathBuf,
-    pub model_cache: PathBuf,
     pub index_file: PathBuf,
 }
 
@@ -76,9 +90,7 @@ impl KnowledgePaths {
             .unwrap_or_else(|| env::temp_dir().join("mague-rc-cache"));
         let root = cache_home.join("mague-rc");
         Self {
-            model_cache: root.join("fastembed"),
-            index_file: root.join("knowledge").join("index-v1.json"),
-            root,
+            index_file: root.join("knowledge").join("index-v3.json"),
         }
     }
 }
@@ -89,8 +101,10 @@ pub struct IndexReport {
     pub section_count: usize,
     pub chunk_count: usize,
     pub dimension: usize,
-    pub model_load: Duration,
     pub embedding: Duration,
+    pub embedding_calls: u64,
+    pub prompt_tokens: u64,
+    pub total_tokens: u64,
     pub total: Duration,
     pub index_path: PathBuf,
     pub index_bytes: u64,
@@ -109,8 +123,10 @@ pub struct SearchHit {
 
 #[derive(Clone, Debug)]
 pub struct QueryReport {
-    pub model_load: Duration,
     pub embedding: Duration,
+    pub embedding_calls: u64,
+    pub prompt_tokens: u64,
+    pub total_tokens: u64,
     pub search: Duration,
     pub hits: Vec<SearchHit>,
     pub index_path: PathBuf,
@@ -136,101 +152,110 @@ pub struct KnowledgeSearchResult {
 pub struct KnowledgeWorkerStats {
     pub searches: u64,
     pub failed: u64,
+    pub coalesced: u64,
 }
 
 pub struct KnowledgeWorkerRuntime {
     pub requests: mpsc::UnboundedSender<KnowledgeSearchRequest>,
     pub results: mpsc::UnboundedReceiver<KnowledgeSearchResult>,
     pub readiness: watch::Receiver<bool>,
-    pub thread: JoinHandle<Result<KnowledgeWorkerStats, KnowledgeError>>,
+    pub task: JoinHandle<Result<KnowledgeWorkerStats, KnowledgeError>>,
 }
 
-pub fn spawn_knowledge_worker() -> Result<KnowledgeWorkerRuntime, KnowledgeError> {
+pub fn spawn_knowledge_worker(
+    config: EmbeddingConfig,
+) -> Result<KnowledgeWorkerRuntime, KnowledgeError> {
     let paths = KnowledgePaths::discover();
     if !paths.index_file.is_file() {
         return Err(KnowledgeError::IndexMissing(paths.index_file));
     }
 
+    let mut retriever = RemoteRetriever::load_at(config, paths)?;
+    retriever.load_index()?;
     let (request_sender, mut request_receiver) =
         mpsc::unbounded_channel::<KnowledgeSearchRequest>();
     let (result_sender, result_receiver) = mpsc::unbounded_channel();
     let (readiness_sender, readiness_receiver) = watch::channel(false);
-    let worker = thread::Builder::new()
-        .name("mague-rc-knowledge".to_owned())
-        .spawn(move || {
-            let mut retriever = LocalRetriever::load_at(paths)?;
-            let _ = readiness_sender.send(true);
-            info!(
-                module = "knowledge",
-                event = "worker_ready",
-                model = MODEL_NAME,
-                model_load_ms = retriever.model_load.as_millis(),
-                "local knowledge worker ready"
-            );
-            let mut stats = KnowledgeWorkerStats::default();
+    let model = retriever.config.model.clone();
+    let dimensions = retriever.config.dimensions;
+    let task = tokio::spawn(async move {
+        let _ = readiness_sender.send(true);
+        info!(
+            module = "knowledge",
+            event = "worker_ready",
+            provider = "openrouter",
+            model,
+            dimensions,
+            "remote knowledge worker ready"
+        );
+        let mut stats = KnowledgeWorkerStats::default();
 
-            while let Some(request) = request_receiver.blocking_recv() {
-                stats.searches += 1;
-                let report = retriever
-                    .query(&request.query, request.top_k)
-                    .map_err(|error| {
-                        stats.failed += 1;
-                        error.to_string()
-                    });
-                if result_sender
-                    .send(KnowledgeSearchResult {
-                        search_id: request.search_id,
-                        turn_id: request.turn_id,
-                        query: request.query,
-                        report,
-                    })
-                    .is_err()
-                {
-                    break;
-                }
+        while let Some(mut request) = request_receiver.recv().await {
+            while let Ok(newer_request) = request_receiver.try_recv() {
+                request = newer_request;
+                stats.coalesced += 1;
             }
-            Ok(stats)
-        })
-        .map_err(KnowledgeError::WorkerStart)?;
+            stats.searches += 1;
+            let report = retriever
+                .query(&request.query, request.top_k)
+                .await
+                .map_err(|error| {
+                    stats.failed += 1;
+                    error.to_string()
+                });
+            if result_sender
+                .send(KnowledgeSearchResult {
+                    search_id: request.search_id,
+                    turn_id: request.turn_id,
+                    query: request.query,
+                    report,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+        Ok(stats)
+    });
 
     Ok(KnowledgeWorkerRuntime {
         requests: request_sender,
         results: result_receiver,
         readiness: readiness_receiver,
-        thread: worker,
+        task,
     })
 }
 
-pub struct LocalRetriever {
-    model: TextEmbedding,
+pub struct RemoteRetriever {
+    client: OpenRouterEmbeddingClient,
+    config: EmbeddingConfig,
     paths: KnowledgePaths,
-    model_load: Duration,
     index: Option<KnowledgeIndex>,
 }
 
-impl LocalRetriever {
-    pub fn load() -> Result<Self, KnowledgeError> {
-        Self::load_at(KnowledgePaths::discover())
+impl RemoteRetriever {
+    pub fn load(config: EmbeddingConfig) -> Result<Self, KnowledgeError> {
+        Self::load_at(config, KnowledgePaths::discover())
     }
 
-    pub fn load_at(paths: KnowledgePaths) -> Result<Self, KnowledgeError> {
-        create_directory(&paths.model_cache)?;
-        let started = Instant::now();
-        let options = TextInitOptions::new(EmbeddingModel::MultilingualE5Small)
-            .with_cache_dir(paths.model_cache.clone())
-            .with_show_download_progress(true)
-            .with_intra_threads(4);
-        let model = TextEmbedding::try_new(options)
-            .map_err(|error| KnowledgeError::Embedding(error.to_string()))?;
+    pub fn load_at(config: EmbeddingConfig, paths: KnowledgePaths) -> Result<Self, KnowledgeError> {
+        let client = OpenRouterEmbeddingClient::new(config.clone())?;
         Ok(Self {
-            model,
+            client,
+            config,
             paths,
-            model_load: started.elapsed(),
             index: None,
         })
     }
 
-    pub fn index(&mut self, source: &Path) -> Result<IndexReport, KnowledgeError> {
+    fn load_index(&mut self) -> Result<(), KnowledgeError> {
+        let index = read_index(&self.paths.index_file)?;
+        validate_index(&index, &self.config)?;
+        self.index = Some(index);
+        Ok(())
+    }
+
+    pub async fn index(&mut self, source: &Path) -> Result<IndexReport, KnowledgeError> {
         let total_started = Instant::now();
         let files = markdown_files(source)?;
         let mut sources = Vec::with_capacity(files.len());
@@ -260,19 +285,29 @@ impl LocalRetriever {
             }
         }
 
-        let inputs = pending
-            .iter()
-            .map(|chunk| format!("passage: {}\n{}", chunk.heading, chunk.text))
-            .collect::<Vec<_>>();
         let embedding_started = Instant::now();
-        let mut embeddings = self
-            .model
-            .embed(inputs, Some(EMBEDDING_BATCH_SIZE))
-            .map_err(|error| KnowledgeError::Embedding(error.to_string()))?;
+        let mut embeddings = Vec::with_capacity(pending.len());
+        let mut embedding_calls = 0_u64;
+        let mut prompt_tokens = 0_u64;
+        let mut total_tokens = 0_u64;
+        for batch in pending.chunks(EMBEDDING_BATCH_SIZE) {
+            let inputs = batch
+                .iter()
+                .map(|chunk| document_input(&chunk.heading, &chunk.text))
+                .collect::<Vec<_>>();
+            let output = self
+                .client
+                .embed(inputs, EmbeddingPurpose::Document)
+                .await?;
+            embedding_calls += 1;
+            prompt_tokens += output.prompt_tokens;
+            total_tokens += output.total_tokens;
+            embeddings.extend(output.embeddings);
+        }
         let embedding_duration = embedding_started.elapsed();
 
         if embeddings.len() != pending.len() {
-            return Err(KnowledgeError::Embedding(format!(
+            return Err(KnowledgeError::EmbeddingProtocol(format!(
                 "model returned {} vectors for {} chunks",
                 embeddings.len(),
                 pending.len()
@@ -296,8 +331,9 @@ impl LocalRetriever {
             .collect::<Vec<_>>();
         let index = KnowledgeIndex {
             schema_version: SCHEMA_VERSION,
-            model: MODEL_NAME.to_owned(),
+            model: self.config.model.clone(),
             dimension,
+            document_input_type: self.config.document_input_type.clone(),
             sources,
             chunks,
         };
@@ -308,9 +344,11 @@ impl LocalRetriever {
             section_count,
             chunk_count: index.chunks.len(),
             dimension,
-            model_load: self.model_load,
             embedding: embedding_duration,
-            total: total_started.elapsed() + self.model_load,
+            embedding_calls,
+            prompt_tokens,
+            total_tokens,
+            total: total_started.elapsed(),
             index_path: self.paths.index_file.clone(),
             index_bytes,
         };
@@ -318,24 +356,26 @@ impl LocalRetriever {
         Ok(report)
     }
 
-    pub fn query(&mut self, query: &str, top_k: usize) -> Result<QueryReport, KnowledgeError> {
+    pub async fn query(
+        &mut self,
+        query: &str,
+        top_k: usize,
+    ) -> Result<QueryReport, KnowledgeError> {
         let query = query.trim();
         if query.is_empty() {
             return Err(KnowledgeError::EmptyQuery);
         }
         if self.index.is_none() {
-            let index = read_index(&self.paths.index_file)?;
-            validate_index(&index)?;
-            self.index = Some(index);
+            self.load_index()?;
         }
 
         let embedding_started = Instant::now();
-        let mut query_embeddings = self
-            .model
-            .embed([format!("query: {query}")], None)
-            .map_err(|error| KnowledgeError::Embedding(error.to_string()))?;
-        let mut query_embedding = query_embeddings.pop().ok_or_else(|| {
-            KnowledgeError::Embedding("model returned no query vector".to_owned())
+        let output = self
+            .client
+            .embed(vec![query_input(query)], EmbeddingPurpose::Query)
+            .await?;
+        let mut query_embedding = output.embeddings.into_iter().next().ok_or_else(|| {
+            KnowledgeError::EmbeddingProtocol("model returned no query vector".to_owned())
         })?;
         normalize_vector(&mut query_embedding);
         let embedding_duration = embedding_started.elapsed();
@@ -376,8 +416,10 @@ impl LocalRetriever {
         hits.truncate(top_k);
 
         Ok(QueryReport {
-            model_load: self.model_load,
             embedding: embedding_duration,
+            embedding_calls: 1,
+            prompt_tokens: output.prompt_tokens,
+            total_tokens: output.total_tokens,
             search: search_started.elapsed(),
             hits,
             index_path: self.paths.index_file.clone(),
@@ -385,11 +427,24 @@ impl LocalRetriever {
     }
 }
 
+fn document_input(heading: &str, text: &str) -> String {
+    if heading.is_empty() {
+        text.to_owned()
+    } else {
+        format!("{heading}\n{text}")
+    }
+}
+
+fn query_input(query: &str) -> String {
+    format!("Instruct: {QUERY_INSTRUCTION}\nQuery: {query}")
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct KnowledgeIndex {
     schema_version: u32,
     model: String,
     dimension: usize,
+    document_input_type: String,
     sources: Vec<SourceMetadata>,
     chunks: Vec<StoredChunk>,
 }
@@ -699,28 +754,35 @@ fn dot_product(left: &[f32], right: &[f32]) -> f32 {
         .sum()
 }
 
-fn validate_index(index: &KnowledgeIndex) -> Result<(), KnowledgeError> {
+fn validate_index(index: &KnowledgeIndex, config: &EmbeddingConfig) -> Result<(), KnowledgeError> {
     if index.schema_version != SCHEMA_VERSION {
         return Err(KnowledgeError::IncompatibleIndex(format!(
             "schema version is {}, expected {}",
             index.schema_version, SCHEMA_VERSION
         )));
     }
-    if index.model != MODEL_NAME {
+    if index.model != config.model {
         return Err(KnowledgeError::IncompatibleIndex(format!(
             "model is {}, expected {}",
-            index.model, MODEL_NAME
+            index.model, config.model
         )));
     }
-    if index.dimension == 0
+    if index.document_input_type != config.document_input_type {
+        return Err(KnowledgeError::IncompatibleIndex(format!(
+            "document input type is {}, expected {}",
+            index.document_input_type, config.document_input_type
+        )));
+    }
+    if index.dimension != config.dimensions
         || index
             .chunks
             .iter()
             .any(|chunk| chunk.embedding.len() != index.dimension)
     {
-        return Err(KnowledgeError::IncompatibleIndex(
-            "stored vector dimensions are invalid".to_owned(),
-        ));
+        return Err(KnowledgeError::IncompatibleIndex(format!(
+            "stored vector dimension is {}, expected {}",
+            index.dimension, config.dimensions
+        )));
     }
     Ok(())
 }
@@ -848,6 +910,23 @@ mod tests {
         let irrelevant = lexical_score(&query, "Сборщик мусора освобождает память");
 
         assert!(relevant > irrelevant);
+    }
+
+    #[test]
+    fn retrieval_instruction_is_only_added_to_queries() {
+        let query = query_input("Как работает ConcurrentHashMap?");
+        let document = document_input(
+            "Java > ConcurrentHashMap",
+            "ConcurrentHashMap поддерживает конкурентный доступ.",
+        );
+
+        assert!(query.starts_with("Instruct: "));
+        assert!(query.contains("\nQuery: Как работает ConcurrentHashMap?"));
+        assert!(!document.contains("Instruct:"));
+        assert_eq!(
+            document,
+            "Java > ConcurrentHashMap\nConcurrentHashMap поддерживает конкурентный доступ."
+        );
     }
 
     #[test]

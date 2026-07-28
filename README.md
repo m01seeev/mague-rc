@@ -12,7 +12,7 @@ The initial target is Wayland with Hyprland. The current implementation captures
 - GTK4 and GTK4 Layer Shell
 - a Wayland compositor with layer-shell support, such as Hyprland
 - Network access to Deepgram and OpenRouter
-- Network access on the first local embedding-model download
+- Network access to the OpenRouter embeddings endpoint
 
 On Arch Linux:
 
@@ -58,23 +58,26 @@ cargo run -- --terminal
 
 ### Local knowledge index
 
-Put private Markdown files under the ignored `knowledge/` directory and build a local semantic index:
+Put private Markdown files under the ignored `knowledge/` directory and build the local vector index through OpenRouter:
 
 ```bash
 cargo run -- rag index knowledge/
 ```
 
-The parser keeps heading hierarchy and text while excluding Markdown images and embedded base64 data. It splits large sections into bounded chunks and embeds them with `intfloat/multilingual-e5-small` (384 dimensions). The model and generated index are stored outside the repository under `${XDG_CACHE_HOME:-~/.cache}/mague-rc/`; neither source documents nor vectors are added to Git.
+The parser keeps heading hierarchy and text while excluding Markdown images and embedded base64 data. It splits large sections into bounded chunks and embeds them through OpenRouter with `nvidia/nemotron-3-embed-1b:free` at 2048 dimensions by default. The existing `OPENROUTER_API_KEY` and `OPENROUTER_BASE_URL` are reused; no second credential is required. The generated index is stored outside the repository under `${XDG_CACHE_HOME:-~/.cache}/mague-rc/`; neither source documents nor vectors are added to Git.
 
-The first index build downloads the local ONNX model. Later runs reuse it and do not require Deepgram, OpenRouter, Python, a separate server, or API keys. Test retrieval directly with:
+Indexing requires OpenRouter once for every changed chunk. Live queries use the same embeddings endpoint while vector similarity and lexical ranking remain local. Neither command requires Deepgram, Groq, Python, a separate server, or a local ML runtime. Test retrieval directly with:
 
 ```bash
 cargo run -- rag query "Чем отличается optimistic locking от pessimistic locking?" --top 5
+
+# Repeat measurements with one reused HTTP client
+cargo run -- rag query "Чем отличается optimistic locking от pessimistic locking?" --top 5 --repeat 3
 ```
 
-The command reports model-load, query-embedding, and search timings plus dense, lexical, and combined scores. The live pipeline loads one resident model and index on a dedicated CPU thread. It submits a retrieval prefetch at most once per `RAG_REFRESH_MS` while the interim transcript grows and forces one on a final transcript. Results from the current utterance accumulate; stale results from an earlier utterance are discarded. At the speech boundary the pipeline waits at most `RAG_FINAL_WAIT_MS`, selects up to `RAG_TOP_K` chunks above `RAG_MIN_SCORE`, caps their text at `RAG_MAX_CONTEXT_CHARS`, and sends them to the LLM separately from the original question.
+The command reports remote embedding tokens/latency and local search timing plus dense, lexical, and combined scores. Every query uses an English retrieval instruction while indexed documents remain instruction-free. OpenRouter input types are configurable because providers use different names: Nemotron expects `query`/`passage`, while Qwen and Perplexity accept `search_query`/`search_document`. The provider response must contain exactly `RAG_EMBEDDING_DIMENSIONS` values; changing the model, dimensions, or document input type requires rebuilding the index. The live pipeline submits a retrieval prefetch at most once per `RAG_REFRESH_MS` while the interim transcript grows and forces one on a final transcript. If the provider is slower than that interval, queued interim versions are coalesced so the worker processes only the newest pending question. Results from the current utterance accumulate; stale results from an earlier utterance are discarded. At the speech boundary the pipeline waits at most `RAG_FINAL_WAIT_MS`; prior interim results require a stricter confidence margin than completed final-query results. It selects up to `RAG_TOP_K` chunks, caps their text at `RAG_MAX_CONTEXT_CHARS`, and sends them to the LLM separately from the original question.
 
-If the index is absent or the local worker fails, speech recognition and LLM answers continue without RAG and the problem is reported in the overlay/log. Set `RAG_ENABLED=false` to disable retrieval explicitly. Re-run `rag index` after changing the source Markdown. Knowledge management through an overlay document picker is not implemented yet.
+If the index is absent or the remote embedding worker fails, speech recognition and LLM answers continue without RAG and the problem is reported in the overlay/log. Set `RAG_ENABLED=false` to disable retrieval explicitly. Re-run `rag index` after changing the source Markdown, `RAG_EMBEDDING_MODEL`, or `RAG_EMBEDDING_DIMENSIONS`. Knowledge management through an overlay document picker is not implemented yet.
 
 ### Repeatable audio benchmark
 
@@ -210,6 +213,6 @@ cargo test
 
 ## Current scope
 
-Implemented: typed configuration, redacted secrets, continuous PCM capture through `ffmpeg`, bounded/unbounded queues with backpressure, authenticated Deepgram WebSocket streaming, keepalive, final/interim event parsing, ordered reconnect with retry, utterance-boundary segmentation with an inactivity fallback, interim-prefetched local semantic retrieval, context-grounded sequential OpenRouter streaming, timeout handling, four-pair voice history, unified output events, terminal output without interleaved streaming responses, a Hyprland-compatible layer-shell overlay, streaming UI updates, pipeline controls, structured diagnostics, repeatable file benchmarks with JSONL telemetry and WER/CER/RAG measurements, and graceful shutdown.
+Implemented: typed configuration, redacted secrets, continuous PCM capture through `ffmpeg`, bounded/unbounded queues with backpressure, authenticated Deepgram WebSocket streaming, keepalive, final/interim event parsing, ordered reconnect with retry, utterance-boundary segmentation with an inactivity fallback, interim-prefetched OpenRouter semantic retrieval with a local index, context-grounded sequential OpenRouter streaming, timeout handling, four-pair voice history, unified output events, terminal output without interleaved streaming responses, a Hyprland-compatible layer-shell overlay, streaming UI updates, pipeline controls, structured diagnostics, repeatable file benchmarks with JSONL telemetry and WER/CER/RAG measurements, and graceful shutdown.
 
 Not implemented: knowledge management in the overlay, OCR, and screenshot flow. Seamless presenter-mode capture exclusion is available externally through the patched `hyprland-presenter` package described above; `mague-rc` itself does not modify the compositor.
