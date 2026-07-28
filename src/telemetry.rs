@@ -18,7 +18,7 @@ use crate::{
     output::{OutputSink, OutputStats},
 };
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Error)]
 pub enum TelemetryError {
@@ -323,6 +323,7 @@ impl TelemetryRecorder {
                 text,
                 is_final,
                 speech_final,
+                speech_final_deferred,
                 audio_start_ms,
                 audio_duration_ms,
                 last_word_end_ms,
@@ -369,20 +370,24 @@ impl TelemetryRecorder {
                 }
                 if *speech_final {
                     self.stt.speech_final_transcripts += 1;
-                    self.last_speech_final_ms = Some(elapsed_ms);
-                    self.last_word_to_boundary_ms = audio_end_ms
-                        .zip(*last_word_end_ms)
-                        .and_then(|(audio_end_ms, last_word_end_ms)| {
-                            audio_end_ms.checked_sub(last_word_end_ms)
-                        })
-                        .and_then(|word_to_audio_end_ms| {
-                            word_to_audio_end_ms.checked_add(delivery_lag_ms.unwrap_or(0))
-                        });
-                    utterance.speech_final_ms = Some(elapsed_ms);
-                    finish_recognition_segment(
-                        &mut self.pending_recognition,
-                        &mut self.recognition_segments,
-                    );
+                    if *speech_final_deferred {
+                        self.stt.deferred_speech_final_transcripts += 1;
+                    } else {
+                        self.last_speech_final_ms = Some(elapsed_ms);
+                        self.last_word_to_boundary_ms = audio_end_ms
+                            .zip(*last_word_end_ms)
+                            .and_then(|(audio_end_ms, last_word_end_ms)| {
+                                audio_end_ms.checked_sub(last_word_end_ms)
+                            })
+                            .and_then(|word_to_audio_end_ms| {
+                                word_to_audio_end_ms.checked_add(delivery_lag_ms.unwrap_or(0))
+                            });
+                        utterance.speech_final_ms = Some(elapsed_ms);
+                        finish_recognition_segment(
+                            &mut self.pending_recognition,
+                            &mut self.recognition_segments,
+                        );
+                    }
                 }
                 (
                     "stt_transcript",
@@ -391,6 +396,7 @@ impl TelemetryRecorder {
                         "chars": text.chars().count(),
                         "is_final": is_final,
                         "speech_final": speech_final,
+                        "speech_final_deferred": speech_final_deferred,
                         "audio_start_ms": audio_start_ms,
                         "audio_duration_ms": audio_duration_ms,
                         "audio_end_ms": audio_end_ms,
@@ -783,6 +789,7 @@ struct SttMetrics {
     interim_transcripts: u64,
     final_transcripts: u64,
     speech_final_transcripts: u64,
+    deferred_speech_final_transcripts: u64,
     speech_started: u64,
     utterance_end: u64,
     ignored_utterance_end: u64,
@@ -1293,6 +1300,7 @@ mod tests {
                 text: "Что такое HashMap?".to_owned(),
                 is_final: true,
                 speech_final: true,
+                speech_final_deferred: false,
                 audio_start_ms: Some(100),
                 audio_duration_ms: Some(900),
                 last_word_end_ms: Some(900),

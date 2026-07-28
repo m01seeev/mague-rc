@@ -103,6 +103,7 @@ pub enum SttObservation {
         text: String,
         is_final: bool,
         speech_final: bool,
+        speech_final_deferred: bool,
         audio_start_ms: Option<u64>,
         audio_duration_ms: Option<u64>,
         last_word_end_ms: Option<u64>,

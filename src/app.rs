@@ -372,6 +372,60 @@ struct TranscriptStats {
     chunks: u64,
 }
 
+const DANGLING_FINAL_WORDS: &[&str] = &[
+    "а",
+    "без",
+    "в",
+    "во",
+    "для",
+    "за",
+    "если",
+    "и",
+    "из",
+    "или",
+    "к",
+    "ко",
+    "которого",
+    "котором",
+    "которой",
+    "которому",
+    "которым",
+    "которыми",
+    "которую",
+    "которые",
+    "которых",
+    "который",
+    "которая",
+    "которое",
+    "либо",
+    "между",
+    "на",
+    "над",
+    "не",
+    "ни",
+    "но",
+    "о",
+    "об",
+    "обо",
+    "от",
+    "перед",
+    "по",
+    "под",
+    "пока",
+    "потому",
+    "при",
+    "про",
+    "с",
+    "со",
+    "у",
+    "хотя",
+    "через",
+    "что",
+    "чего",
+    "чем",
+    "чтобы",
+];
+
 #[derive(Clone, Copy)]
 enum TranscriptCommand {
     SetPaused(bool),
@@ -513,12 +567,18 @@ fn handle_deepgram_event(
             last_word_end_ms,
         } if !text.is_empty() => {
             stats.transcripts += 1;
+            assembler.push_transcript(&text, is_final);
+            let dangling_word = (is_final && speech_final)
+                .then(|| assembler.preview())
+                .and_then(|preview| dangling_final_word(&preview));
+            let speech_final_deferred = dangling_word.is_some();
             send_output(
                 output,
                 OutputEvent::SttObservation(SttObservation::Transcript {
                     text: text.clone(),
                     is_final,
                     speech_final,
+                    speech_final_deferred,
                     audio_start_ms,
                     audio_duration_ms,
                     last_word_end_ms,
@@ -541,13 +601,21 @@ fn handle_deepgram_event(
                     "interim transcript"
                 );
             }
-            assembler.push_transcript(&text, is_final);
             if let Some(last_word_end_ms) = last_word_end_ms {
                 *pending_last_word_end_ms = Some(last_word_end_ms);
             }
             send_transcript_draft(assembler, output)?;
             if is_final && speech_final {
-                flush_reason = Some("speech_final");
+                if let Some(trailing_word) = dangling_word {
+                    debug!(
+                        module = "transcript",
+                        event = "speech_final_deferred",
+                        trailing_word,
+                        "waiting for utterance end after a dangling final word"
+                    );
+                } else {
+                    flush_reason = Some("speech_final");
+                }
             }
         }
         DeepgramEvent::Transcript { .. } => {}
@@ -612,6 +680,18 @@ fn handle_deepgram_event(
         }
     }
     Ok(flush_reason)
+}
+
+fn dangling_final_word(text: &str) -> Option<&'static str> {
+    let word = text
+        .split_whitespace()
+        .next_back()?
+        .trim_matches(|character: char| !character.is_alphanumeric());
+    let normalized = word.to_lowercase();
+    DANGLING_FINAL_WORDS
+        .iter()
+        .copied()
+        .find(|candidate| normalized == *candidate)
 }
 
 fn handle_stt_status(
@@ -884,6 +964,7 @@ mod tests {
                 text,
                 is_final: true,
                 speech_final: true,
+                speech_final_deferred: false,
                 audio_start_ms: Some(100),
                 audio_duration_ms: Some(900),
                 last_word_end_ms: Some(900),
@@ -901,6 +982,125 @@ mod tests {
                 flush_reason,
             })) if text == "Что такое HashMap?" && flush_reason == "speech_final"
         ));
+    }
+
+    #[tokio::test]
+    async fn dangling_speech_final_waits_for_utterance_end() {
+        let (event_sender, event_receiver) = mpsc::unbounded_channel();
+        let (request_sender, mut request_receiver) = llm_request_channel(0);
+        let (output_sender, mut output_receiver) = mpsc::unbounded_channel();
+        let (_command_sender, command_receiver) = mpsc::unbounded_channel();
+
+        event_sender
+            .send(DeepgramEvent::Transcript {
+                text: "Расскажите, за счет чего".to_owned(),
+                is_final: true,
+                speech_final: true,
+                audio_start_ms: Some(100),
+                audio_duration_ms: Some(900),
+                last_word_end_ms: Some(900),
+            })
+            .expect("dangling speech final must send");
+        event_sender
+            .send(DeepgramEvent::UtteranceEnd {
+                last_word_end_ms: Some(900),
+            })
+            .expect("utterance end must send");
+        drop(event_sender);
+
+        let stats = run_transcript_windows(
+            event_receiver,
+            request_sender,
+            output_sender,
+            command_receiver,
+            TranscriptConfig {
+                window_sec: 60,
+                min_utterance_chars: 3,
+            },
+            None,
+        )
+        .await
+        .expect("transcript worker must stop cleanly");
+
+        assert_eq!(stats.chunks, 1);
+        assert_eq!(
+            request_receiver
+                .recv()
+                .await
+                .expect("utterance end must queue the deferred question")
+                .text,
+            "Расскажите, за счет чего"
+        );
+        assert_eq!(request_receiver.recv().await, None);
+
+        let mut deferred = false;
+        let mut flush_reason = None;
+        while let Ok(event) = output_receiver.try_recv() {
+            match event {
+                OutputEvent::SttObservation(SttObservation::Transcript {
+                    speech_final_deferred,
+                    ..
+                }) => deferred |= speech_final_deferred,
+                OutputEvent::Transcript(transcript) => {
+                    flush_reason = Some(transcript.flush_reason);
+                }
+                _ => {}
+            }
+        }
+        assert!(deferred);
+        assert_eq!(flush_reason.as_deref(), Some("utterance_end"));
+    }
+
+    #[tokio::test]
+    async fn continued_speech_is_joined_after_dangling_speech_final() {
+        let (event_sender, event_receiver) = mpsc::unbounded_channel();
+        let (request_sender, mut request_receiver) = llm_request_channel(0);
+        let (output_sender, _output_receiver) = mpsc::unbounded_channel();
+        let (_command_sender, command_receiver) = mpsc::unbounded_channel();
+
+        for event in [
+            DeepgramEvent::Transcript {
+                text: "Расскажите о".to_owned(),
+                is_final: true,
+                speech_final: true,
+                audio_start_ms: Some(100),
+                audio_duration_ms: Some(900),
+                last_word_end_ms: Some(900),
+            },
+            DeepgramEvent::Transcript {
+                text: "ConcurrentHashMap?".to_owned(),
+                is_final: true,
+                speech_final: true,
+                audio_start_ms: Some(1_000),
+                audio_duration_ms: Some(800),
+                last_word_end_ms: Some(1_700),
+            },
+        ] {
+            event_sender.send(event).expect("STT event must send");
+        }
+        drop(event_sender);
+
+        let stats = run_transcript_windows(
+            event_receiver,
+            request_sender,
+            output_sender,
+            command_receiver,
+            TranscriptConfig {
+                window_sec: 60,
+                min_utterance_chars: 3,
+            },
+            None,
+        )
+        .await
+        .expect("transcript worker must stop cleanly");
+
+        assert_eq!(stats.chunks, 1);
+        let request = request_receiver
+            .recv()
+            .await
+            .expect("continued question must be queued");
+        assert_eq!(request.text, "Расскажите о ConcurrentHashMap?");
+        assert_eq!(request_receiver.recv().await, None);
     }
 
     #[tokio::test]
@@ -1189,6 +1389,7 @@ mod tests {
                 text: "что такое".to_owned(),
                 is_final: false,
                 speech_final: false,
+                speech_final_deferred: false,
                 audio_start_ms: None,
                 audio_duration_ms: None,
                 last_word_end_ms: None,
@@ -1206,6 +1407,7 @@ mod tests {
                 text: "что такое HashMap".to_owned(),
                 is_final: false,
                 speech_final: false,
+                speech_final_deferred: false,
                 audio_start_ms: None,
                 audio_duration_ms: None,
                 last_word_end_ms: None,
@@ -1217,6 +1419,17 @@ mod tests {
                 text: "что такое HashMap".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn detects_only_obviously_dangling_final_words() {
+        assert_eq!(
+            dangling_final_word("Расскажите, за счет ЧЕГО..."),
+            Some("чего")
+        );
+        assert_eq!(dangling_final_word("В чем разница между"), Some("между"));
+        assert_eq!(dangling_final_word("Что такое HashMap?"), None);
+        assert_eq!(dangling_final_word("Что произойдет после?"), None);
     }
 
     #[tokio::test]
