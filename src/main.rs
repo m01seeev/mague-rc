@@ -4,6 +4,7 @@ use mague_rc::{
     app::{self, RunOptions},
     config::Config,
     error::AppError,
+    knowledge::LocalRetriever,
     output::TerminalOutputSink,
     overlay,
     stt::install_tls_crypto_provider,
@@ -26,17 +27,18 @@ fn run() -> Result<(), AppError> {
     init_tracing()?;
     install_tls_crypto_provider()?;
     let mode = run_mode()?;
-    let config = Config::load()?;
     match mode {
         RunMode::Overlay => {
+            let config = Config::load()?;
             overlay::run(config).map_err(|error| AppError::Overlay(error.to_string()))
         }
-        RunMode::Terminal => runtime()?.block_on(app::run(config)),
+        RunMode::Terminal => runtime()?.block_on(app::run(Config::load()?)),
         RunMode::Benchmark {
             audio,
             label,
             reference,
         } => {
+            let config = Config::load()?;
             if !audio.is_file() {
                 return Err(AppError::Argument(format!(
                     "benchmark audio file does not exist: {}",
@@ -72,6 +74,50 @@ fn run() -> Result<(), AppError> {
                 },
             ))
         }
+        RunMode::RagIndex { source } => {
+            let mut retriever = LocalRetriever::load()?;
+            let report = retriever.index(&source)?;
+            println!(
+                "indexed {} source(s), {} section(s), {} chunk(s), {} dimensions",
+                report.source_count, report.section_count, report.chunk_count, report.dimension
+            );
+            println!(
+                "timing: model={} ms embedding={} ms total={} ms",
+                report.model_load.as_millis(),
+                report.embedding.as_millis(),
+                report.total.as_millis()
+            );
+            println!(
+                "index: {} ({} bytes)",
+                report.index_path.display(),
+                report.index_bytes
+            );
+            Ok(())
+        }
+        RunMode::RagQuery { query, top_k } => {
+            let mut retriever = LocalRetriever::load()?;
+            let report = retriever.query(&query, top_k)?;
+            println!(
+                "timing: model={} ms query_embedding={} ms search={} ms",
+                report.model_load.as_millis(),
+                report.embedding.as_millis(),
+                report.search.as_millis()
+            );
+            println!("index: {}", report.index_path.display());
+            for (position, hit) in report.hits.iter().enumerate() {
+                println!(
+                    "\n#{} score={:.4} dense={:.4} lexical={:.4}\n{} [{}]\n{}",
+                    position + 1,
+                    hit.combined_score,
+                    hit.dense_score,
+                    hit.lexical_score,
+                    hit.heading,
+                    hit.source.display(),
+                    excerpt(&hit.text, 500)
+                );
+            }
+            Ok(())
+        }
     }
 }
 
@@ -82,6 +128,13 @@ enum RunMode {
         audio: PathBuf,
         label: String,
         reference: Option<PathBuf>,
+    },
+    RagIndex {
+        source: PathBuf,
+    },
+    RagQuery {
+        query: String,
+        top_k: usize,
     },
 }
 
@@ -130,10 +183,70 @@ fn run_mode() -> Result<RunMode, AppError> {
                 reference,
             })
         }
+        Some("rag") => match arguments.next().as_deref() {
+            Some("index") => {
+                let source = arguments.next().map(PathBuf::from).ok_or_else(|| {
+                    AppError::Argument("rag index requires a Markdown file or directory".to_owned())
+                })?;
+                if let Some(argument) = arguments.next() {
+                    return Err(AppError::Argument(format!(
+                        "unexpected rag index argument: {argument}"
+                    )));
+                }
+                Ok(RunMode::RagIndex { source })
+            }
+            Some("query") => parse_rag_query(arguments.collect()),
+            Some(command) => Err(AppError::Argument(format!(
+                "unknown rag command `{command}`; expected index or query"
+            ))),
+            None => Err(AppError::Argument(
+                "rag requires an index or query command".to_owned(),
+            )),
+        },
         Some(argument) => Err(AppError::Argument(format!(
-            "unknown argument `{argument}`; expected --overlay, --terminal, or --benchmark"
+            "unknown argument `{argument}`; expected --overlay, --terminal, --benchmark, or rag"
         ))),
     }
+}
+
+fn parse_rag_query(arguments: Vec<String>) -> Result<RunMode, AppError> {
+    let mut query_parts = Vec::new();
+    let mut top_k = 5_usize;
+    let mut arguments = arguments.into_iter();
+    while let Some(argument) = arguments.next() {
+        if argument == "--top" {
+            let value = arguments
+                .next()
+                .ok_or_else(|| AppError::Argument("--top requires a positive number".to_owned()))?;
+            top_k = value.parse().map_err(|_| {
+                AppError::Argument(format!("invalid --top value `{value}`; expected a number"))
+            })?;
+            if top_k == 0 {
+                return Err(AppError::Argument(
+                    "--top must be greater than zero".to_owned(),
+                ));
+            }
+        } else {
+            query_parts.push(argument);
+        }
+    }
+    if query_parts.is_empty() {
+        return Err(AppError::Argument(
+            "rag query requires question text".to_owned(),
+        ));
+    }
+    Ok(RunMode::RagQuery {
+        query: query_parts.join(" "),
+        top_k,
+    })
+}
+
+fn excerpt(text: &str, max_chars: usize) -> String {
+    let mut excerpt = text.chars().take(max_chars).collect::<String>();
+    if text.chars().count() > max_chars {
+        excerpt.push_str("...");
+    }
+    excerpt
 }
 
 fn runtime() -> Result<tokio::runtime::Runtime, AppError> {

@@ -2,7 +2,7 @@
 
 `mague-rc` is a local AI overlay for technical interviews, designed primarily for tiling window managers on Linux. Traditional desktop environments already have comparable assistant and overlay options, while tiling setups need a lightweight tool that integrates cleanly without replacing the window-management workflow.
 
-The initial target is Wayland with Hyprland. The current implementation captures system audio through `ffmpeg`, streams raw PCM to Deepgram, groups recognition results by detected utterance boundaries, and streams OpenRouter answers in a layer-shell window. A terminal mode remains available for diagnostics. RAG and screenshot processing are intentionally introduced in later stages.
+The initial target is Wayland with Hyprland. The current implementation captures system audio through `ffmpeg`, streams raw PCM to Deepgram, groups recognition results by detected utterance boundaries, retrieves relevant local knowledge, and streams context-grounded OpenRouter answers in a layer-shell window. A terminal mode remains available for diagnostics. Screenshot processing remains a later stage.
 
 ## Requirements
 
@@ -12,6 +12,7 @@ The initial target is Wayland with Hyprland. The current implementation captures
 - GTK4 and GTK4 Layer Shell
 - a Wayland compositor with layer-shell support, such as Hyprland
 - Network access to Deepgram and OpenRouter
+- Network access on the first local embedding-model download
 
 On Arch Linux:
 
@@ -55,6 +56,26 @@ For the diagnostic terminal output instead:
 cargo run -- --terminal
 ```
 
+### Local knowledge index
+
+Put private Markdown files under the ignored `knowledge/` directory and build a local semantic index:
+
+```bash
+cargo run -- rag index knowledge/
+```
+
+The parser keeps heading hierarchy and text while excluding Markdown images and embedded base64 data. It splits large sections into bounded chunks and embeds them with `intfloat/multilingual-e5-small` (384 dimensions). The model and generated index are stored outside the repository under `${XDG_CACHE_HOME:-~/.cache}/mague-rc/`; neither source documents nor vectors are added to Git.
+
+The first index build downloads the local ONNX model. Later runs reuse it and do not require Deepgram, OpenRouter, Python, a separate server, or API keys. Test retrieval directly with:
+
+```bash
+cargo run -- rag query "Чем отличается optimistic locking от pessimistic locking?" --top 5
+```
+
+The command reports model-load, query-embedding, and search timings plus dense, lexical, and combined scores. The live pipeline loads one resident model and index on a dedicated CPU thread. It submits a retrieval prefetch at most once per `RAG_REFRESH_MS` while the interim transcript grows and forces one on a final transcript. Results from the current utterance accumulate; stale results from an earlier utterance are discarded. At the speech boundary the pipeline waits at most `RAG_FINAL_WAIT_MS`, selects up to `RAG_TOP_K` chunks above `RAG_MIN_SCORE`, caps their text at `RAG_MAX_CONTEXT_CHARS`, and sends them to the LLM separately from the original question.
+
+If the index is absent or the local worker fails, speech recognition and LLM answers continue without RAG and the problem is reported in the overlay/log. Set `RAG_ENABLED=false` to disable retrieval explicitly. Re-run `rag index` after changing the source Markdown. Knowledge management through an overlay document picker is not implemented yet.
+
 ### Repeatable audio benchmark
 
 Replay a prerecorded file through the same `ffmpeg -> Deepgram -> utterance segmentation -> OpenRouter` pipeline:
@@ -84,7 +105,7 @@ Each run writes two ignored artifacts under `telemetry/`:
 - `*.events.jsonl` is the chronological event stream with monotonic timestamps and raw STT/LLM events.
 - `*.summary.json` contains run metadata, audio/reference hashes, effective non-secret configuration, Git branch/commit/dirty state, recognized utterances, submitted questions, complete answers, token usage, cost, and aggregate latency distributions.
 
-The request summary separates question construction, queue wait, LLM time to first token, generation time, speech-boundary-to-first-token latency, and estimated full last-word-to-first-token latency. The full estimate adds Deepgram's final-word-to-boundary interval to the locally measured boundary-to-token duration, so audio-clock drift cannot produce a value shorter than the boundary latency. It includes endpointing, non-negative STT delivery lag, queueing, and LLM TTFT. The STT summary reports approximate delivery lag for interim/final transcripts, speech-start events, and utterance-end events from Deepgram's audio positions; the raw receive and audio timestamps remain in JSONL for inspection. These provider timestamps are useful for comparisons but are not guaranteed to be millisecond-precise. With a reference file the summary also reports normalized word error rate (`WER`) and character error rate (`CER`) globally and per line.
+The request summary separates question construction, RAG searches and final wait, queue wait, LLM time to first token, generation time, speech-boundary-to-first-token latency, and estimated full last-word-to-first-token latency. Each attached RAG context records chunk headings, scores, character count, accumulated embedding/search time, and boundary wait. The full latency estimate adds Deepgram's final-word-to-boundary interval to the locally measured boundary-to-token duration, so audio-clock drift cannot produce a value shorter than the boundary latency. It includes endpointing, non-negative STT delivery lag, queueing, and LLM TTFT. The STT summary reports approximate delivery lag for interim/final transcripts, speech-start events, and utterance-end events from Deepgram's audio positions; the raw receive and audio timestamps remain in JSONL for inspection. These provider timestamps are useful for comparisons but are not guaranteed to be millisecond-precise. With a reference file the summary also reports normalized word error rate (`WER`) and character error rate (`CER`) globally and per line.
 
 Use the same base commit and audio hash when comparing implementations. Keep the benchmark harness on the base branch, create one branch per strategy, and run each strategy several times because provider/network latency varies:
 
@@ -189,6 +210,6 @@ cargo test
 
 ## Current scope
 
-Implemented: typed configuration, redacted secrets, continuous PCM capture through `ffmpeg`, bounded/unbounded queues with backpressure, authenticated Deepgram WebSocket streaming, keepalive, final/interim event parsing, ordered reconnect with retry, utterance-boundary segmentation with an inactivity fallback, sequential OpenRouter streaming, timeout handling, four-pair voice history, unified output events, terminal output without interleaved streaming responses, a Hyprland-compatible layer-shell overlay, streaming UI updates, pipeline controls, structured diagnostics, repeatable file benchmarks with JSONL telemetry and WER/CER scoring, and graceful shutdown.
+Implemented: typed configuration, redacted secrets, continuous PCM capture through `ffmpeg`, bounded/unbounded queues with backpressure, authenticated Deepgram WebSocket streaming, keepalive, final/interim event parsing, ordered reconnect with retry, utterance-boundary segmentation with an inactivity fallback, interim-prefetched local semantic retrieval, context-grounded sequential OpenRouter streaming, timeout handling, four-pair voice history, unified output events, terminal output without interleaved streaming responses, a Hyprland-compatible layer-shell overlay, streaming UI updates, pipeline controls, structured diagnostics, repeatable file benchmarks with JSONL telemetry and WER/CER/RAG measurements, and graceful shutdown.
 
-Not implemented: RAG, OCR, and screenshot flow. Seamless presenter-mode capture exclusion is available externally through the patched `hyprland-presenter` package described above; `mague-rc` itself does not modify the compositor.
+Not implemented: knowledge management in the overlay, OCR, and screenshot flow. Seamless presenter-mode capture exclusion is available externally through the patched `hyprland-presenter` package described above; `mague-rc` itself does not modify the compositor.

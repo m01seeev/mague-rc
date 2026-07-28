@@ -4,6 +4,7 @@ use crate::{
     app::TranscriptWorkerError,
     audio::AudioError,
     config::ConfigError,
+    knowledge::KnowledgeError,
     llm::{LlmError, LlmQueueError, LlmWorkerError},
     stt::SttError,
 };
@@ -36,6 +37,9 @@ pub enum AppError {
 
     #[error(transparent)]
     TranscriptWorker(#[from] TranscriptWorkerError),
+
+    #[error(transparent)]
+    Knowledge(#[from] KnowledgeError),
 
     #[error("output sink failed: {0}")]
     Output(String),

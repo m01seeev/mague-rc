@@ -1,4 +1,6 @@
-use std::{path::PathBuf, time::Duration};
+use std::{
+    collections::HashMap, path::PathBuf, thread::JoinHandle as ThreadJoinHandle, time::Duration,
+};
 
 use thiserror::Error;
 use tokio::{
@@ -10,13 +12,16 @@ use tracing::{debug, info, warn};
 
 use crate::{
     audio::{AudioError, AudioSource, FfmpegAudioSource, audio_frame_channel},
-    config::{Config, TranscriptConfig},
+    config::{Config, KnowledgeConfig, TranscriptConfig},
     control::TerminalEchoGuard,
     error::AppError,
     events::{
-        AppCommand, AppErrorView, DeepgramEvent, LlmCommand, LlmRequest, Mode, OutputComponent,
-        OutputEvent, QueueKind, QueueState, StatusKind, StatusMessage, SttObservation, SttStatus,
-        TranscriptChunk, TranscriptView,
+        AppCommand, AppErrorView, DeepgramEvent, KnowledgeContext, KnowledgeSnippet, LlmCommand,
+        LlmRequest, Mode, OutputComponent, OutputEvent, QueueKind, QueueState, RetrievalView,
+        StatusKind, StatusMessage, SttObservation, SttStatus, TranscriptChunk, TranscriptView,
+    },
+    knowledge::{
+        KnowledgeSearchRequest, KnowledgeSearchResult, KnowledgeWorkerStats, spawn_knowledge_worker,
     },
     llm::{
         LlmQueueError, LlmRequestSender, LlmWorker, OpenRouterTextProvider, llm_request_channel,
@@ -99,6 +104,38 @@ where
         }),
     )?;
 
+    let (retrieval, knowledge_thread) = if config.knowledge.enabled {
+        match spawn_knowledge_worker() {
+            Ok(runtime) => (
+                Some(RetrievalPipeline::new(
+                    config.knowledge.clone(),
+                    runtime.requests,
+                    runtime.results,
+                    runtime.readiness,
+                )),
+                Some(runtime.thread),
+            ),
+            Err(error) => {
+                warn!(
+                    module = "knowledge",
+                    event = "disabled",
+                    error = %error,
+                    "local knowledge retrieval disabled"
+                );
+                send_output(
+                    &output_sender,
+                    OutputEvent::Error(AppErrorView {
+                        component: OutputComponent::Knowledge,
+                        message: error.to_string(),
+                    }),
+                )?;
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
+
     let audio_source = match options.audio_file {
         Some(path) => FfmpegAudioSource::from_file(
             config.audio.clone(),
@@ -140,13 +177,14 @@ where
         drop(readiness_sender);
         tokio::spawn(stt_provider.run(frame_receiver, stt_event_sender, shutdown_receiver))
     };
-    let mut transcript_task = tokio::spawn(run_transcript_windows(
+    let mut transcript_task = tokio::spawn(run_transcript_windows_with_retrieval(
         stt_event_receiver,
         llm_request_sender,
         output_sender.clone(),
         transcript_command_receiver,
         config.transcript,
         transcript_readiness,
+        retrieval,
     ));
     let mut llm_task = tokio::spawn(llm_worker.run(
         llm_request_receiver,
@@ -292,6 +330,7 @@ where
         shutdown_timeout,
     )
     .await?;
+    let knowledge_stats = finish_knowledge_thread(knowledge_thread).await;
     let llm_stats = finish_task("LLM", &mut llm_task, llm_completed, shutdown_timeout).await?;
     if output_sender
         .send(OutputEvent::Status(StatusMessage {
@@ -331,6 +370,8 @@ where
         transcript_events = transcript_stats.transcripts,
         final_transcripts = transcript_stats.final_transcripts,
         transcript_chunks = transcript_stats.chunks,
+        knowledge_searches = knowledge_stats.searches,
+        knowledge_failed = knowledge_stats.failed,
         llm_requests = llm_stats.requests,
         llm_completed = llm_stats.completed,
         llm_failed = llm_stats.failed,
@@ -370,6 +411,251 @@ struct TranscriptStats {
     transcripts: u64,
     final_transcripts: u64,
     chunks: u64,
+}
+
+struct RetrievalPipeline {
+    config: KnowledgeConfig,
+    requests: mpsc::UnboundedSender<KnowledgeSearchRequest>,
+    results: mpsc::UnboundedReceiver<KnowledgeSearchResult>,
+    readiness: watch::Receiver<bool>,
+    turn_id: u64,
+    next_search_id: u64,
+    last_dispatch_at: Option<Instant>,
+    last_query: String,
+    last_search_id: Option<u64>,
+    accumulated: HashMap<String, KnowledgeSnippet>,
+    completed: HashMap<u64, Vec<String>>,
+    searches: u64,
+    embedding_ms: u64,
+    search_ms: u64,
+    last_error: Option<String>,
+}
+
+impl RetrievalPipeline {
+    fn new(
+        config: KnowledgeConfig,
+        requests: mpsc::UnboundedSender<KnowledgeSearchRequest>,
+        results: mpsc::UnboundedReceiver<KnowledgeSearchResult>,
+        readiness: watch::Receiver<bool>,
+    ) -> Self {
+        Self {
+            config,
+            requests,
+            results,
+            readiness,
+            turn_id: 0,
+            next_search_id: 0,
+            last_dispatch_at: None,
+            last_query: String::new(),
+            last_search_id: None,
+            accumulated: HashMap::new(),
+            completed: HashMap::new(),
+            searches: 0,
+            embedding_ms: 0,
+            search_ms: 0,
+            last_error: None,
+        }
+    }
+
+    async fn wait_until_ready(&mut self) {
+        loop {
+            if *self.readiness.borrow_and_update() {
+                return;
+            }
+            if self.readiness.changed().await.is_err() {
+                self.last_error = Some("knowledge worker failed during initialization".to_owned());
+                return;
+            }
+        }
+    }
+
+    fn prefetch(&mut self, query: &str, force: bool) {
+        self.drain_ready();
+        let query = query.trim();
+        if query.is_empty() || query == self.last_query {
+            return;
+        }
+        let refresh = Duration::from_millis(self.config.refresh_ms);
+        if !force
+            && self
+                .last_dispatch_at
+                .is_some_and(|started| started.elapsed() < refresh)
+        {
+            return;
+        }
+        self.dispatch(query);
+    }
+
+    async fn resolve(&mut self, query: &str) -> Result<Option<KnowledgeContext>, String> {
+        self.drain_ready();
+        let query = query.trim();
+        let search_id = if query == self.last_query {
+            self.last_search_id
+        } else {
+            self.dispatch(query)
+        };
+
+        let wait_started = Instant::now();
+        if let Some(search_id) = search_id
+            && !self.completed.contains_key(&search_id)
+        {
+            let deadline = sleep(Duration::from_millis(self.config.final_wait_ms));
+            tokio::pin!(deadline);
+            loop {
+                tokio::select! {
+                    _ = &mut deadline => break,
+                    result = self.results.recv() => match result {
+                        Some(result) => {
+                            let completed_id = result.search_id;
+                            self.accept_result(result);
+                            if completed_id == search_id {
+                                break;
+                            }
+                        }
+                        None => {
+                            self.last_error
+                                .get_or_insert_with(|| "knowledge worker stopped".to_owned());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let final_wait_ms = wait_started.elapsed().as_millis() as u64;
+
+        let mut ordered_ids = search_id
+            .and_then(|id| self.completed.get(&id))
+            .cloned()
+            .unwrap_or_default();
+        let mut remaining = self.accumulated.values().collect::<Vec<_>>();
+        remaining.sort_by(|left, right| right.score.total_cmp(&left.score));
+        for snippet in remaining {
+            if !ordered_ids.contains(&snippet.id) {
+                ordered_ids.push(snippet.id.clone());
+            }
+        }
+
+        let mut snippets = Vec::new();
+        let mut remaining_chars = self.config.max_context_chars;
+        for id in ordered_ids {
+            if snippets.len() >= self.config.top_k || remaining_chars == 0 {
+                break;
+            }
+            let Some(snippet) = self.accumulated.get(&id) else {
+                continue;
+            };
+            let mut snippet = snippet.clone();
+            let text_chars = snippet.text.chars().count();
+            if text_chars > remaining_chars {
+                snippet.text = snippet.text.chars().take(remaining_chars).collect();
+            }
+            remaining_chars = remaining_chars.saturating_sub(snippet.text.chars().count());
+            snippets.push(snippet);
+        }
+
+        if snippets.is_empty() {
+            if let Some(error) = self.last_error.take() {
+                return Err(error);
+            }
+            return Ok(None);
+        }
+
+        Ok(Some(KnowledgeContext {
+            snippets,
+            searches: self.searches,
+            embedding_ms: self.embedding_ms,
+            search_ms: self.search_ms,
+            final_wait_ms,
+        }))
+    }
+
+    fn dispatch(&mut self, query: &str) -> Option<u64> {
+        let search_id = self.next_search_id;
+        self.next_search_id += 1;
+        let request = KnowledgeSearchRequest {
+            search_id,
+            turn_id: self.turn_id,
+            query: query.to_owned(),
+            top_k: self.config.top_k,
+        };
+        if self.requests.send(request).is_err() {
+            self.last_error = Some("knowledge worker request channel closed".to_owned());
+            return None;
+        }
+        self.searches += 1;
+        self.last_dispatch_at = Some(Instant::now());
+        self.last_query = query.to_owned();
+        self.last_search_id = Some(search_id);
+        Some(search_id)
+    }
+
+    fn drain_ready(&mut self) {
+        while let Ok(result) = self.results.try_recv() {
+            self.accept_result(result);
+        }
+    }
+
+    fn accept_result(&mut self, result: KnowledgeSearchResult) {
+        if result.turn_id != self.turn_id {
+            return;
+        }
+        match result.report {
+            Ok(report) => {
+                self.embedding_ms += report.embedding.as_millis() as u64;
+                self.search_ms += report.search.as_millis() as u64;
+                let mut ids = Vec::new();
+                for hit in report
+                    .hits
+                    .into_iter()
+                    .filter(|hit| hit.combined_score >= self.config.min_score)
+                {
+                    ids.push(hit.id.clone());
+                    let snippet = KnowledgeSnippet {
+                        id: hit.id.clone(),
+                        source: hit.source.display().to_string(),
+                        heading: hit.heading,
+                        text: hit.text,
+                        score: hit.combined_score,
+                    };
+                    self.accumulated
+                        .entry(hit.id)
+                        .and_modify(|current| {
+                            if snippet.score > current.score {
+                                current.clone_from(&snippet);
+                            }
+                        })
+                        .or_insert(snippet);
+                }
+                self.completed.insert(result.search_id, ids);
+                if self.config.debug {
+                    debug!(
+                        module = "knowledge",
+                        event = "prefetch_completed",
+                        search_id = result.search_id,
+                        turn_id = result.turn_id,
+                        query = %result.query,
+                        hits = self.completed[&result.search_id].len(),
+                        "local knowledge prefetch completed"
+                    );
+                }
+            }
+            Err(error) => self.last_error = Some(error),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.turn_id += 1;
+        self.last_dispatch_at = None;
+        self.last_query.clear();
+        self.last_search_id = None;
+        self.accumulated.clear();
+        self.completed.clear();
+        self.searches = 0;
+        self.embedding_ms = 0;
+        self.search_ms = 0;
+        self.last_error = None;
+        self.drain_ready();
+    }
 }
 
 const DANGLING_FINAL_WORDS: &[&str] = &[
@@ -507,16 +793,41 @@ enum TranscriptCommand {
     SetPaused(bool),
 }
 
+#[cfg(test)]
 async fn run_transcript_windows(
+    events: mpsc::UnboundedReceiver<DeepgramEvent>,
+    llm_requests: LlmRequestSender,
+    output: mpsc::UnboundedSender<OutputEvent>,
+    commands: mpsc::UnboundedReceiver<TranscriptCommand>,
+    config: TranscriptConfig,
+    readiness: Option<watch::Receiver<bool>>,
+) -> Result<TranscriptStats, TranscriptWorkerError> {
+    run_transcript_windows_with_retrieval(
+        events,
+        llm_requests,
+        output,
+        commands,
+        config,
+        readiness,
+        None,
+    )
+    .await
+}
+
+async fn run_transcript_windows_with_retrieval(
     mut events: mpsc::UnboundedReceiver<DeepgramEvent>,
     llm_requests: LlmRequestSender,
     output: mpsc::UnboundedSender<OutputEvent>,
     mut commands: mpsc::UnboundedReceiver<TranscriptCommand>,
     config: TranscriptConfig,
     readiness: Option<watch::Receiver<bool>>,
+    mut retrieval: Option<RetrievalPipeline>,
 ) -> Result<TranscriptStats, TranscriptWorkerError> {
     if let Some(readiness) = readiness {
         wait_for_transcript_readiness(readiness).await?;
+    }
+    if let Some(retrieval) = retrieval.as_mut() {
+        retrieval.wait_until_ready().await;
     }
     let mut stats = TranscriptStats::default();
     let fallback_duration = Duration::from_secs(config.window_sec);
@@ -541,6 +852,9 @@ async fn run_transcript_windows(
                             pending_last_word_end_ms = None;
                             interim_fallback_deferred = false;
                             fallback_armed = false;
+                            if let Some(retrieval) = retrieval.as_mut() {
+                                retrieval.reset();
+                            }
                             send_transcript_draft(&assembler, &output)?;
                         }
                     }
@@ -565,6 +879,7 @@ async fn run_transcript_windows(
                         &output,
                         &mut stats,
                         "inactivity_timeout",
+                        &mut retrieval,
                     )
                     .await?;
                     pending_last_word_end_ms = None;
@@ -578,6 +893,13 @@ async fn run_transcript_windows(
                     let has_transcript = matches!(
                         &event,
                         DeepgramEvent::Transcript { text, .. } if !text.is_empty()
+                    );
+                    let force_retrieval = matches!(
+                        &event,
+                        DeepgramEvent::Transcript {
+                            is_final: true,
+                            ..
+                        }
                     );
                     let flush_reason =
                         handle_deepgram_event(
@@ -594,6 +916,9 @@ async fn run_transcript_windows(
                             .reset(Instant::now() + fallback_duration);
                         interim_fallback_deferred = false;
                         fallback_armed = true;
+                        if let Some(retrieval) = retrieval.as_mut() {
+                            retrieval.prefetch(&assembler.preview(), force_retrieval);
+                        }
                     }
                     if let Some(reason) = flush_reason {
                         flush_transcript_utterance(
@@ -602,6 +927,7 @@ async fn run_transcript_windows(
                             &output,
                             &mut stats,
                             reason,
+                            &mut retrieval,
                         )
                         .await?;
                         pending_last_word_end_ms = None;
@@ -614,7 +940,14 @@ async fn run_transcript_windows(
         }
     }
 
-    finish_transcript_window(&mut assembler, &llm_requests, &output, &mut stats).await?;
+    finish_transcript_window(
+        &mut assembler,
+        &llm_requests,
+        &output,
+        &mut stats,
+        &mut retrieval,
+    )
+    .await?;
     Ok(stats)
 }
 
@@ -903,8 +1236,17 @@ async fn flush_transcript_utterance(
     output: &mpsc::UnboundedSender<OutputEvent>,
     stats: &mut TranscriptStats,
     reason: &'static str,
+    retrieval: &mut Option<RetrievalPipeline>,
 ) -> Result<(), TranscriptWorkerError> {
-    queue_transcript_chunk(assembler.finish(), llm_requests, output, stats, reason).await?;
+    queue_transcript_chunk(
+        assembler.finish(),
+        llm_requests,
+        output,
+        stats,
+        reason,
+        retrieval,
+    )
+    .await?;
     send_transcript_draft(assembler, output)
 }
 
@@ -925,8 +1267,17 @@ async fn finish_transcript_window(
     llm_requests: &LlmRequestSender,
     output: &mpsc::UnboundedSender<OutputEvent>,
     stats: &mut TranscriptStats,
+    retrieval: &mut Option<RetrievalPipeline>,
 ) -> Result<(), TranscriptWorkerError> {
-    queue_transcript_chunk(assembler.finish(), llm_requests, output, stats, "shutdown").await
+    queue_transcript_chunk(
+        assembler.finish(),
+        llm_requests,
+        output,
+        stats,
+        "shutdown",
+        retrieval,
+    )
+    .await
 }
 
 async fn queue_transcript_chunk(
@@ -935,6 +1286,7 @@ async fn queue_transcript_chunk(
     output: &mpsc::UnboundedSender<OutputEvent>,
     stats: &mut TranscriptStats,
     reason: &'static str,
+    retrieval: &mut Option<RetrievalPipeline>,
 ) -> Result<(), TranscriptWorkerError> {
     let Some(chunk) = chunk else {
         return Ok(());
@@ -957,11 +1309,59 @@ async fn queue_transcript_chunk(
             flush_reason: reason.to_owned(),
         }),
     )?;
+    let knowledge = if let Some(retrieval) = retrieval.as_mut() {
+        match retrieval.resolve(&chunk.text).await {
+            Ok(context) => {
+                if let Some(context) = context.as_ref() {
+                    info!(
+                        module = "knowledge",
+                        event = "context_attached",
+                        request_id,
+                        searches = context.searches,
+                        snippets = context.snippets.len(),
+                        embedding_ms = context.embedding_ms,
+                        search_ms = context.search_ms,
+                        final_wait_ms = context.final_wait_ms,
+                        "local knowledge context attached"
+                    );
+                    send_output(
+                        output,
+                        OutputEvent::Retrieval(RetrievalView {
+                            request_id,
+                            context: context.clone(),
+                        }),
+                    )?;
+                }
+                context
+            }
+            Err(error) => {
+                warn!(
+                    module = "knowledge",
+                    event = "search_failed",
+                    request_id,
+                    error = %error,
+                    "local knowledge search failed"
+                );
+                send_output(
+                    output,
+                    OutputEvent::Error(AppErrorView {
+                        component: OutputComponent::Knowledge,
+                        message: error,
+                    }),
+                )?;
+                None
+            }
+        }
+    } else {
+        None
+    };
+    send_output(output, OutputEvent::LlmQueued { request_id })?;
     llm_requests
         .send(LlmRequest {
             request_id,
             mode: Mode::Voice,
             text: chunk.text,
+            knowledge,
         })
         .await?;
     stats.chunks += 1;
@@ -981,6 +1381,9 @@ async fn queue_transcript_chunk(
             queue_len,
             "LLM request queue is growing"
         );
+    }
+    if let Some(retrieval) = retrieval.as_mut() {
+        retrieval.reset();
     }
     Ok(())
 }
@@ -1029,6 +1432,54 @@ async fn wait_for_transcript_readiness(
             .changed()
             .await
             .map_err(|_| TranscriptWorkerError::SttReadinessClosed)?;
+    }
+}
+
+async fn finish_knowledge_thread(
+    thread: Option<
+        ThreadJoinHandle<Result<KnowledgeWorkerStats, crate::knowledge::KnowledgeError>>,
+    >,
+) -> KnowledgeWorkerStats {
+    let Some(thread) = thread else {
+        return KnowledgeWorkerStats::default();
+    };
+    match tokio::task::spawn_blocking(move || thread.join()).await {
+        Ok(Ok(Ok(stats))) => stats,
+        Ok(Ok(Err(error))) => {
+            warn!(
+                module = "knowledge",
+                event = "worker_failed",
+                error = %error,
+                "local knowledge worker failed"
+            );
+            KnowledgeWorkerStats {
+                searches: 0,
+                failed: 1,
+            }
+        }
+        Ok(Err(_)) => {
+            warn!(
+                module = "knowledge",
+                event = "worker_panicked",
+                "local knowledge worker panicked"
+            );
+            KnowledgeWorkerStats {
+                searches: 0,
+                failed: 1,
+            }
+        }
+        Err(error) => {
+            warn!(
+                module = "knowledge",
+                event = "worker_join_failed",
+                error = %error,
+                "could not join local knowledge worker"
+            );
+            KnowledgeWorkerStats {
+                searches: 0,
+                failed: 1,
+            }
+        }
     }
 }
 
@@ -1675,5 +2126,96 @@ mod tests {
                 len: 17,
             }))
         );
+    }
+
+    #[tokio::test]
+    async fn retrieval_accumulates_interim_hits_and_prioritizes_final_query() {
+        let (request_sender, mut request_receiver) = mpsc::unbounded_channel();
+        let (result_sender, result_receiver) = mpsc::unbounded_channel();
+        let (_readiness_sender, readiness_receiver) = watch::channel(true);
+        let mut retrieval = RetrievalPipeline::new(
+            KnowledgeConfig {
+                enabled: true,
+                top_k: 2,
+                max_context_chars: 2_000,
+                min_score: 0.75,
+                refresh_ms: 1_000,
+                final_wait_ms: 50,
+                debug: false,
+            },
+            request_sender,
+            result_receiver,
+            readiness_receiver,
+        );
+
+        retrieval.prefetch("Что такое блокировка", true);
+        let first = request_receiver.recv().await.expect("prefetch must send");
+        result_sender
+            .send(KnowledgeSearchResult {
+                search_id: first.search_id,
+                turn_id: first.turn_id,
+                query: first.query,
+                report: Ok(query_report(
+                    "old",
+                    "Общие сведения",
+                    "Старый interim-фрагмент",
+                    0.80,
+                )),
+            })
+            .expect("first result must send");
+
+        let final_query = "Чем отличается optimistic locking от pessimistic locking?";
+        retrieval.prefetch(final_query, true);
+        let second = request_receiver
+            .recv()
+            .await
+            .expect("final prefetch must send");
+        result_sender
+            .send(KnowledgeSearchResult {
+                search_id: second.search_id,
+                turn_id: second.turn_id,
+                query: second.query,
+                report: Ok(query_report(
+                    "final",
+                    "Hibernate > Блокировки",
+                    "Optimistic использует version, pessimistic блокирует данные.",
+                    0.91,
+                )),
+            })
+            .expect("final result must send");
+
+        let context = retrieval
+            .resolve(final_query)
+            .await
+            .expect("retrieval must succeed")
+            .expect("context must be selected");
+
+        assert_eq!(context.searches, 2);
+        assert_eq!(context.snippets.len(), 2);
+        assert_eq!(context.snippets[0].id, "final");
+        assert_eq!(context.snippets[1].id, "old");
+    }
+
+    fn query_report(
+        id: &str,
+        heading: &str,
+        text: &str,
+        score: f32,
+    ) -> crate::knowledge::QueryReport {
+        crate::knowledge::QueryReport {
+            model_load: Duration::ZERO,
+            embedding: Duration::from_millis(8),
+            search: Duration::from_millis(1),
+            hits: vec![crate::knowledge::SearchHit {
+                id: id.to_owned(),
+                source: PathBuf::from("knowledge/java.md"),
+                heading: heading.to_owned(),
+                text: text.to_owned(),
+                dense_score: score,
+                lexical_score: 0.0,
+                combined_score: score,
+            }],
+            index_path: PathBuf::from("index.json"),
+        }
     }
 }

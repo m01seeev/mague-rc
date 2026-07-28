@@ -65,11 +65,36 @@ impl fmt::Display for Mode {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LlmRequest {
     pub request_id: u64,
     pub mode: Mode,
     pub text: String,
+    pub knowledge: Option<KnowledgeContext>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct KnowledgeSnippet {
+    pub id: String,
+    pub source: String,
+    pub heading: String,
+    pub text: String,
+    pub score: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct KnowledgeContext {
+    pub snippets: Vec<KnowledgeSnippet>,
+    pub searches: u64,
+    pub embedding_ms: u64,
+    pub search_ms: u64,
+    pub final_wait_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RetrievalView {
+    pub request_id: u64,
+    pub context: KnowledgeContext,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,6 +183,7 @@ pub enum OutputComponent {
     App,
     Audio,
     Stt,
+    Knowledge,
     Llm,
 }
 
@@ -167,6 +193,7 @@ impl fmt::Display for OutputComponent {
             Self::App => formatter.write_str("app"),
             Self::Audio => formatter.write_str("audio"),
             Self::Stt => formatter.write_str("stt"),
+            Self::Knowledge => formatter.write_str("knowledge"),
             Self::Llm => formatter.write_str("llm"),
         }
     }
@@ -184,6 +211,8 @@ pub enum OutputEvent {
     SttObservation(SttObservation),
     TranscriptDraft { text: String },
     Transcript(TranscriptView),
+    Retrieval(RetrievalView),
+    LlmQueued { request_id: u64 },
     AnswerStarted(AnswerMeta),
     AnswerDelta { request_id: u64, text: String },
     AnswerUsage { request_id: u64, usage: LlmUsage },

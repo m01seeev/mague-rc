@@ -48,7 +48,7 @@ pub struct Config {
     pub vision: VisionConfig,
     pub audio: AudioConfig,
     pub transcript: TranscriptConfig,
-    pub legend: LegendConfig,
+    pub knowledge: KnowledgeConfig,
     pub screenshot: ScreenshotConfig,
 }
 
@@ -108,15 +108,13 @@ pub struct TranscriptConfig {
 }
 
 #[derive(Clone, Debug)]
-pub struct LegendConfig {
+pub struct KnowledgeConfig {
     pub enabled: bool,
-    pub path: PathBuf,
     pub top_k: usize,
-    pub chunk_chars: usize,
     pub max_context_chars: usize,
     pub min_score: f32,
-    pub recent_user_turns: usize,
-    pub reload_on_change: bool,
+    pub refresh_ms: u64,
+    pub final_wait_ms: u64,
     pub debug: bool,
 }
 
@@ -204,16 +202,14 @@ impl Config {
                 window_sec: reader.parse("TRANSCRIPT_WINDOW_SEC", 5)?,
                 min_utterance_chars: reader.parse("MIN_UTTERANCE_CHARS", 3)?,
             },
-            legend: LegendConfig {
-                enabled: reader.boolean("LEGEND_ENABLED", true)?,
-                path: PathBuf::from(reader.string("LEGEND_PATH", "legend.md")),
-                top_k: reader.parse("LEGEND_TOP_K", 2)?,
-                chunk_chars: reader.parse("LEGEND_CHUNK_CHARS", 2_200)?,
-                max_context_chars: reader.parse("LEGEND_MAX_CONTEXT_CHARS", 4_200)?,
-                min_score: reader.parse("LEGEND_MIN_SCORE", 1.6)?,
-                recent_user_turns: reader.parse("LEGEND_RECENT_USER_TURNS", 2)?,
-                reload_on_change: reader.boolean("LEGEND_RELOAD_ON_CHANGE", true)?,
-                debug: reader.boolean("LEGEND_DEBUG", false)?,
+            knowledge: KnowledgeConfig {
+                enabled: reader.boolean("RAG_ENABLED", true)?,
+                top_k: reader.parse("RAG_TOP_K", 3)?,
+                max_context_chars: reader.parse("RAG_MAX_CONTEXT_CHARS", 4_200)?,
+                min_score: reader.parse("RAG_MIN_SCORE", 0.75)?,
+                refresh_ms: reader.parse("RAG_REFRESH_MS", 1_000)?,
+                final_wait_ms: reader.parse("RAG_FINAL_WAIT_MS", 80)?,
+                debug: reader.boolean("RAG_DEBUG", false)?,
             },
             screenshot: ScreenshotConfig {
                 enabled: reader.boolean("ENABLE_OCR", true)?,
@@ -282,11 +278,11 @@ impl Config {
         )?;
         positive("MIN_UTTERANCE_CHARS", self.transcript.min_utterance_chars)?;
 
-        non_empty_path("LEGEND_PATH", &self.legend.path)?;
-        positive("LEGEND_TOP_K", self.legend.top_k)?;
-        positive("LEGEND_CHUNK_CHARS", self.legend.chunk_chars)?;
-        positive("LEGEND_MAX_CONTEXT_CHARS", self.legend.max_context_chars)?;
-        finite_min("LEGEND_MIN_SCORE", self.legend.min_score, 0.0)?;
+        positive("RAG_TOP_K", self.knowledge.top_k)?;
+        positive("RAG_MAX_CONTEXT_CHARS", self.knowledge.max_context_chars)?;
+        finite_range("RAG_MIN_SCORE", self.knowledge.min_score, 0.0, 2.0)?;
+        positive("RAG_REFRESH_MS", self.knowledge.refresh_ms)?;
+        positive("RAG_FINAL_WAIT_MS", self.knowledge.final_wait_ms)?;
 
         non_empty_path("SCREENSHOT_PATH", &self.screenshot.path)?;
         non_empty_path("PID_FILE", &self.screenshot.pid_file)?;
@@ -535,7 +531,7 @@ mod tests {
         assert_eq!(config.audio.chunk_ms, 100);
         assert_eq!(config.transcript.window_sec, 5);
         assert_eq!(config.llm.max_history_pairs, 4);
-        assert_eq!(config.legend.top_k, 2);
+        assert_eq!(config.knowledge.top_k, 3);
         assert!(config.screenshot.enabled);
     }
 
@@ -673,11 +669,11 @@ mod tests {
     fn parses_supported_boolean_forms() {
         let mut values = valid_values();
         values.insert("ENABLE_OCR".to_owned(), "off".to_owned());
-        values.insert("LEGEND_DEBUG".to_owned(), "yes".to_owned());
+        values.insert("RAG_DEBUG".to_owned(), "yes".to_owned());
 
         let config = Config::from_values(&values).expect("boolean forms should parse");
 
         assert!(!config.screenshot.enabled);
-        assert!(config.legend.debug);
+        assert!(config.knowledge.debug);
     }
 }

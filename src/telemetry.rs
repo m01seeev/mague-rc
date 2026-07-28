@@ -18,7 +18,7 @@ use crate::{
     output::{OutputSink, OutputStats},
 };
 
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 
 #[derive(Debug, Error)]
 pub enum TelemetryError {
@@ -223,7 +223,7 @@ impl TelemetryRecorder {
                 metrics.question.clone_from(&transcript.text);
                 metrics.flush_reason.clone_from(&transcript.flush_reason);
                 metrics.draft_started_ms = self.draft_started_ms.take();
-                metrics.question_queued_ms = Some(elapsed_ms);
+                metrics.question_ready_ms = Some(elapsed_ms);
                 metrics.last_final_ms = self.last_final_ms.take();
                 metrics.speech_final_ms = self.last_speech_final_ms.take();
                 metrics.utterance_end_ms = self.last_utterance_end_ms.take();
@@ -231,7 +231,7 @@ impl TelemetryRecorder {
                 metrics.last_word_to_boundary_ms = self.last_word_to_boundary_ms.take();
                 self.draft_active = false;
                 (
-                    "question_queued",
+                    "question_ready",
                     Some(transcript.sequence),
                     json!({
                         "text": transcript.text,
@@ -240,6 +240,60 @@ impl TelemetryRecorder {
                         "flush_reason": transcript.flush_reason,
                     }),
                 )
+            }
+            OutputEvent::Retrieval(retrieval) => {
+                let context = &retrieval.context;
+                self.requests
+                    .entry(retrieval.request_id)
+                    .or_default()
+                    .retrieval = Some(RetrievalMetrics {
+                    searches: context.searches,
+                    snippets: context.snippets.len(),
+                    context_chars: context
+                        .snippets
+                        .iter()
+                        .map(|snippet| snippet.text.chars().count())
+                        .sum(),
+                    embedding_ms: context.embedding_ms,
+                    search_ms: context.search_ms,
+                    final_wait_ms: context.final_wait_ms,
+                    hits: context
+                        .snippets
+                        .iter()
+                        .map(|snippet| RetrievalHitMetrics {
+                            source: snippet.source.clone(),
+                            heading: snippet.heading.clone(),
+                            score: snippet.score,
+                        })
+                        .collect(),
+                });
+                (
+                    "rag_context_attached",
+                    Some(retrieval.request_id),
+                    json!({
+                        "searches": context.searches,
+                        "snippets": context.snippets.len(),
+                        "context_chars": context
+                            .snippets
+                            .iter()
+                            .map(|snippet| snippet.text.chars().count())
+                            .sum::<usize>(),
+                        "embedding_ms": context.embedding_ms,
+                        "search_ms": context.search_ms,
+                        "final_wait_ms": context.final_wait_ms,
+                        "hits": context.snippets.iter().map(|snippet| json!({
+                            "id": snippet.id,
+                            "source": snippet.source,
+                            "heading": snippet.heading,
+                            "score": snippet.score,
+                            "chars": snippet.text.chars().count(),
+                        })).collect::<Vec<_>>(),
+                    }),
+                )
+            }
+            OutputEvent::LlmQueued { request_id } => {
+                self.requests.entry(*request_id).or_default().llm_queued_ms = Some(elapsed_ms);
+                ("llm_queued", Some(*request_id), json!({}))
             }
             OutputEvent::AnswerStarted(meta) => {
                 self.active_request = Some(meta.request_id);
@@ -638,6 +692,12 @@ struct ConfigurationSnapshot {
     max_history_pairs: usize,
     temperature: f32,
     max_tokens: u32,
+    rag_enabled: bool,
+    rag_top_k: usize,
+    rag_max_context_chars: usize,
+    rag_min_score: f32,
+    rag_refresh_ms: u64,
+    rag_final_wait_ms: u64,
 }
 
 impl From<&Config> for ConfigurationSnapshot {
@@ -662,6 +722,12 @@ impl From<&Config> for ConfigurationSnapshot {
             max_history_pairs: config.llm.max_history_pairs,
             temperature: config.llm.temperature,
             max_tokens: config.llm.max_tokens,
+            rag_enabled: config.knowledge.enabled,
+            rag_top_k: config.knowledge.top_k,
+            rag_max_context_chars: config.knowledge.max_context_chars,
+            rag_min_score: config.knowledge.min_score,
+            rag_refresh_ms: config.knowledge.refresh_ms,
+            rag_final_wait_ms: config.knowledge.final_wait_ms,
         }
     }
 }
@@ -677,13 +743,33 @@ struct RequestMetrics {
     utterance_end_ms: Option<u64>,
     last_word_end_audio_ms: Option<u64>,
     last_word_to_boundary_ms: Option<u64>,
-    question_queued_ms: Option<u64>,
+    question_ready_ms: Option<u64>,
+    llm_queued_ms: Option<u64>,
     llm_started_ms: Option<u64>,
     first_token_ms: Option<u64>,
     completed_ms: Option<u64>,
     failed_ms: Option<u64>,
     answer_chars: u64,
     usage: Option<LlmUsage>,
+    retrieval: Option<RetrievalMetrics>,
+}
+
+#[derive(Serialize)]
+struct RetrievalMetrics {
+    searches: u64,
+    snippets: usize,
+    context_chars: usize,
+    embedding_ms: u64,
+    search_ms: u64,
+    final_wait_ms: u64,
+    hits: Vec<RetrievalHitMetrics>,
+}
+
+#[derive(Serialize)]
+struct RetrievalHitMetrics {
+    source: String,
+    heading: String,
+    score: f32,
 }
 
 #[derive(Serialize)]
@@ -701,12 +787,14 @@ struct RequestSummary {
     utterance_end_ms: Option<u64>,
     last_word_end_audio_ms: Option<u64>,
     last_word_to_boundary_ms: Option<u64>,
-    question_queued_ms: Option<u64>,
+    question_ready_ms: Option<u64>,
+    llm_queued_ms: Option<u64>,
     llm_started_ms: Option<u64>,
     first_token_ms: Option<u64>,
     completed_ms: Option<u64>,
     failed_ms: Option<u64>,
     build_ms: Option<u64>,
+    retrieval_pipeline_ms: Option<u64>,
     final_to_queue_ms: Option<u64>,
     speech_final_to_queue_ms: Option<u64>,
     utterance_end_to_queue_ms: Option<u64>,
@@ -717,6 +805,7 @@ struct RequestSummary {
     last_word_to_first_token_ms: Option<u64>,
     generation_ms: Option<u64>,
     total_request_ms: Option<u64>,
+    retrieval: Option<RetrievalMetrics>,
     usage: Option<LlmUsageSummary>,
 }
 
@@ -735,16 +824,14 @@ impl RequestSummary {
             question_chars: metrics.question.chars().count(),
             question_words: word_count(&metrics.question),
             answer_chars: metrics.answer_chars,
-            build_ms: duration(metrics.question_queued_ms, metrics.draft_started_ms),
-            final_to_queue_ms: duration(metrics.question_queued_ms, metrics.last_final_ms),
-            speech_final_to_queue_ms: duration(metrics.question_queued_ms, metrics.speech_final_ms),
-            utterance_end_to_queue_ms: duration(
-                metrics.question_queued_ms,
-                metrics.utterance_end_ms,
-            ),
-            queue_wait_ms: duration(metrics.llm_started_ms, metrics.question_queued_ms),
+            build_ms: duration(metrics.question_ready_ms, metrics.draft_started_ms),
+            retrieval_pipeline_ms: duration(metrics.llm_queued_ms, metrics.question_ready_ms),
+            final_to_queue_ms: duration(metrics.llm_queued_ms, metrics.last_final_ms),
+            speech_final_to_queue_ms: duration(metrics.llm_queued_ms, metrics.speech_final_ms),
+            utterance_end_to_queue_ms: duration(metrics.llm_queued_ms, metrics.utterance_end_ms),
+            queue_wait_ms: duration(metrics.llm_started_ms, metrics.llm_queued_ms),
             ttft_ms: duration(metrics.first_token_ms, metrics.llm_started_ms),
-            queued_to_first_token_ms: duration(metrics.first_token_ms, metrics.question_queued_ms),
+            queued_to_first_token_ms: duration(metrics.first_token_ms, metrics.llm_queued_ms),
             speech_boundary_to_first_token_ms,
             last_word_to_first_token_ms,
             generation_ms: duration(metrics.completed_ms, metrics.first_token_ms),
@@ -758,11 +845,13 @@ impl RequestSummary {
             utterance_end_ms: metrics.utterance_end_ms,
             last_word_end_audio_ms: metrics.last_word_end_audio_ms,
             last_word_to_boundary_ms: metrics.last_word_to_boundary_ms,
-            question_queued_ms: metrics.question_queued_ms,
+            question_ready_ms: metrics.question_ready_ms,
+            llm_queued_ms: metrics.llm_queued_ms,
             llm_started_ms: metrics.llm_started_ms,
             first_token_ms: metrics.first_token_ms,
             completed_ms: metrics.completed_ms,
             failed_ms: metrics.failed_ms,
+            retrieval: metrics.retrieval,
             usage: metrics.usage.map(LlmUsageSummary::from),
         }
     }
@@ -809,7 +898,15 @@ struct AggregateSummary {
     completion_tokens: u64,
     total_tokens: u64,
     total_cost: f64,
+    rag_request_count: usize,
+    rag_searches: u64,
+    rag_snippets: usize,
+    rag_context_chars: usize,
     build_ms: MetricSummary,
+    retrieval_pipeline_ms: MetricSummary,
+    rag_embedding_ms: MetricSummary,
+    rag_search_ms: MetricSummary,
+    rag_final_wait_ms: MetricSummary,
     queue_wait_ms: MetricSummary,
     ttft_ms: MetricSummary,
     queued_to_first_token_ms: MetricSummary,
@@ -825,6 +922,10 @@ impl AggregateSummary {
             .iter()
             .filter_map(|request| request.usage.as_ref())
             .collect::<Vec<_>>();
+        let retrieval = requests
+            .iter()
+            .filter_map(|request| request.retrieval.as_ref())
+            .collect::<Vec<_>>();
         Self {
             request_count: requests.len(),
             completed_count: requests
@@ -839,7 +940,26 @@ impl AggregateSummary {
             completion_tokens: usage.iter().map(|usage| usage.completion_tokens).sum(),
             total_tokens: usage.iter().map(|usage| usage.total_tokens).sum(),
             total_cost: usage.iter().filter_map(|usage| usage.cost).sum(),
+            rag_request_count: retrieval.len(),
+            rag_searches: retrieval.iter().map(|retrieval| retrieval.searches).sum(),
+            rag_snippets: retrieval.iter().map(|retrieval| retrieval.snippets).sum(),
+            rag_context_chars: retrieval
+                .iter()
+                .map(|retrieval| retrieval.context_chars)
+                .sum(),
             build_ms: metric_summary(requests.iter().filter_map(|request| request.build_ms)),
+            retrieval_pipeline_ms: metric_summary(
+                requests
+                    .iter()
+                    .filter_map(|request| request.retrieval_pipeline_ms),
+            ),
+            rag_embedding_ms: metric_summary(
+                retrieval.iter().map(|retrieval| retrieval.embedding_ms),
+            ),
+            rag_search_ms: metric_summary(retrieval.iter().map(|retrieval| retrieval.search_ms)),
+            rag_final_wait_ms: metric_summary(
+                retrieval.iter().map(|retrieval| retrieval.final_wait_ms),
+            ),
             queue_wait_ms: metric_summary(
                 requests.iter().filter_map(|request| request.queue_wait_ms),
             ),
@@ -1250,10 +1370,12 @@ mod tests {
     use super::*;
     use crate::{
         config::{
-            AudioConfig, DeepgramConfig, LegendConfig, LlmConfig, ScreenshotConfig, SecretString,
-            TranscriptConfig, VisionConfig,
+            AudioConfig, DeepgramConfig, KnowledgeConfig, LlmConfig, ScreenshotConfig,
+            SecretString, TranscriptConfig, VisionConfig,
         },
-        events::{AnswerMeta, Mode, TranscriptView},
+        events::{
+            AnswerMeta, KnowledgeContext, KnowledgeSnippet, Mode, RetrievalView, TranscriptView,
+        },
     };
 
     #[test]
@@ -1331,6 +1453,27 @@ mod tests {
             }))
             .expect("question must be recorded");
         recorder
+            .record(&OutputEvent::Retrieval(RetrievalView {
+                request_id: 0,
+                context: KnowledgeContext {
+                    snippets: vec![KnowledgeSnippet {
+                        id: "hash-map".to_owned(),
+                        source: "knowledge/java.md".to_owned(),
+                        heading: "Java > HashMap".to_owned(),
+                        text: "HashMap хранит пары ключ-значение.".to_owned(),
+                        score: 0.91,
+                    }],
+                    searches: 2,
+                    embedding_ms: 16,
+                    search_ms: 2,
+                    final_wait_ms: 7,
+                },
+            }))
+            .expect("retrieval must be recorded");
+        recorder
+            .record(&OutputEvent::LlmQueued { request_id: 0 })
+            .expect("LLM queue submission must be recorded");
+        recorder
             .record(&OutputEvent::AnswerStarted(AnswerMeta {
                 request_id: 0,
                 mode: Mode::Voice,
@@ -1368,8 +1511,12 @@ mod tests {
         assert_eq!(summary["metadata"]["audio_bytes"], 20);
         assert_eq!(summary["aggregates"]["request_count"], 1);
         assert_eq!(summary["aggregates"]["total_tokens"], 120);
+        assert_eq!(summary["aggregates"]["rag_request_count"], 1);
+        assert_eq!(summary["aggregates"]["rag_searches"], 2);
         assert_eq!(summary["recognition_segments"][0], "Что такое HashMap?");
         assert_eq!(summary["requests"][0]["flush_reason"], "timer");
+        assert_eq!(summary["requests"][0]["retrieval"]["snippets"], 1);
+        assert_eq!(summary["requests"][0]["retrieval"]["searches"], 2);
         assert_eq!(
             summary["requests"][0]["answer"],
             "HashMap хранит пары ключ-значение."
@@ -1480,15 +1627,13 @@ mod tests {
                 window_sec: 5,
                 min_utterance_chars: 3,
             },
-            legend: LegendConfig {
+            knowledge: KnowledgeConfig {
                 enabled: false,
-                path: PathBuf::from("legend.md"),
-                top_k: 2,
-                chunk_chars: 2_200,
+                top_k: 3,
                 max_context_chars: 4_200,
-                min_score: 1.6,
-                recent_user_turns: 2,
-                reload_on_change: true,
+                min_score: 0.75,
+                refresh_ms: 1_000,
+                final_wait_ms: 80,
                 debug: false,
             },
             screenshot: ScreenshotConfig {

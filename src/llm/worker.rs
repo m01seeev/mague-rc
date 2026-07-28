@@ -10,7 +10,7 @@ use crate::{
     events::{AnswerMeta, AppErrorView, LlmCommand, LlmRequest, OutputComponent, OutputEvent},
     llm::{
         ChatMessage, ChatRequest, ConversationHistories, LlmError, LlmRequestReceiver,
-        LlmStreamEvent, TextLlmProvider, voice_system_prompt,
+        LlmStreamEvent, TextLlmProvider, knowledge_context_prompt, voice_system_prompt,
     },
 };
 
@@ -149,6 +149,9 @@ where
             &self.config.current_project,
         )));
         messages.extend(history);
+        if let Some(knowledge) = request.knowledge.as_ref() {
+            messages.push(ChatMessage::system(knowledge_context_prompt(knowledge)));
+        }
         messages.push(ChatMessage::user(request.text.clone()));
 
         let started_at = Instant::now();
@@ -289,6 +292,7 @@ mod tests {
             request_id,
             mode: Mode::Voice,
             text: format!("question {request_id}"),
+            knowledge: None,
         }
     }
 
@@ -366,5 +370,51 @@ mod tests {
         let requests = captured.lock().expect("request mutex must not be poisoned");
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[1].messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn inserts_knowledge_before_question_without_storing_it_in_history() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let provider = FakeProvider {
+            requests: Arc::clone(&captured),
+        };
+        let worker = LlmWorker::new(provider, config());
+        let (sender, receiver) = llm_request_channel(0);
+        let (command_sender, command_receiver) = mpsc::unbounded_channel();
+        let (event_sender, _event_receiver) = mpsc::unbounded_channel();
+        let mut first = request(1);
+        first.knowledge = Some(crate::events::KnowledgeContext {
+            snippets: vec![crate::events::KnowledgeSnippet {
+                id: "chunk".to_owned(),
+                source: "knowledge/java.md".to_owned(),
+                heading: "Java > HashMap".to_owned(),
+                text: "HashMap хранит пары ключ-значение.".to_owned(),
+                score: 0.9,
+            }],
+            searches: 1,
+            embedding_ms: 8,
+            search_ms: 1,
+            final_wait_ms: 0,
+        });
+
+        sender.send(first).await.expect("first request must send");
+        sender
+            .send(request(2))
+            .await
+            .expect("second request must send");
+        drop(sender);
+        drop(command_sender);
+        worker
+            .run(receiver, command_receiver, event_sender)
+            .await
+            .expect("worker must finish");
+
+        let requests = captured.lock().expect("request mutex must not be poisoned");
+        assert_eq!(requests[0].messages.len(), 3);
+        assert_eq!(requests[0].messages[1].role, ChatRole::System);
+        assert!(requests[0].messages[1].content.contains("Java > HashMap"));
+        assert_eq!(requests[0].messages[2].content, "question 1");
+        assert_eq!(requests[1].messages.len(), 4);
+        assert_eq!(requests[1].messages[1].content, "question 1");
     }
 }

@@ -147,7 +147,10 @@ impl AppSnapshot {
                 }
             }
             OutputEvent::AnswerCompleted { .. } => {}
-            OutputEvent::SttObservation(_) | OutputEvent::AnswerUsage { .. } => {}
+            OutputEvent::SttObservation(_)
+            | OutputEvent::Retrieval(_)
+            | OutputEvent::LlmQueued { .. }
+            | OutputEvent::AnswerUsage { .. } => {}
             OutputEvent::QueueState(queue) => match queue.queue {
                 QueueKind::Audio => self.audio_queue_len = queue.len,
                 QueueKind::Llm => self.llm_queue_len = queue.len,
@@ -170,7 +173,7 @@ impl AppSnapshot {
                             turn.answer_status = AnswerStatus::Failed;
                         }
                     }
-                    OutputComponent::App | OutputComponent::Audio => {}
+                    OutputComponent::App | OutputComponent::Audio | OutputComponent::Knowledge => {}
                 }
             }
         }

@@ -103,7 +103,9 @@ impl OverlayState {
                     _ => {}
                 }
             }
-            OutputEvent::Error(_) => self.status = String::from("Error"),
+            OutputEvent::Error(error) if error.component != OutputComponent::Knowledge => {
+                self.status = String::from("Error");
+            }
             OutputEvent::AnswerStarted(_) => self.status = String::from("Thinking"),
             OutputEvent::AnswerCompleted { .. } if !self.paused => {
                 self.status = String::from("Listening");

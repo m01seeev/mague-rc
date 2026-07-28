@@ -51,6 +51,8 @@ fn update_stats(stats: &mut OutputStats, event: &OutputEvent) {
         }
         OutputEvent::SttObservation(_)
         | OutputEvent::TranscriptDraft { .. }
+        | OutputEvent::Retrieval(_)
+        | OutputEvent::LlmQueued { .. }
         | OutputEvent::AnswerDelta { .. }
         | OutputEvent::AnswerUsage { .. }
         | OutputEvent::QueueState(_)

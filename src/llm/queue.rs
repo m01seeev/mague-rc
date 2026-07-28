@@ -143,6 +143,7 @@ mod tests {
             request_id,
             mode: Mode::Voice,
             text: format!("request {request_id}"),
+            knowledge: None,
         }
     }
 

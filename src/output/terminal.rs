@@ -77,6 +77,8 @@ impl TerminalRenderer {
             }
             OutputEvent::SttObservation(_)
             | OutputEvent::TranscriptDraft { .. }
+            | OutputEvent::Retrieval(_)
+            | OutputEvent::LlmQueued { .. }
             | OutputEvent::AnswerUsage { .. } => {}
             OutputEvent::AnswerDelta { .. } | OutputEvent::AnswerCompleted { .. } => {}
             event if self.active_answer.is_some() => self.pending.push_back(event),
@@ -124,6 +126,8 @@ impl TerminalRenderer {
             }
             OutputEvent::SttObservation(_)
             | OutputEvent::TranscriptDraft { .. }
+            | OutputEvent::Retrieval(_)
+            | OutputEvent::LlmQueued { .. }
             | OutputEvent::AnswerUsage { .. } => {}
             OutputEvent::AnswerStarted(meta) => {
                 self.stats.started += 1;
