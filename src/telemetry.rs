@@ -18,7 +18,7 @@ use crate::{
     output::{OutputSink, OutputStats},
 };
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Error)]
 pub enum TelemetryError {
@@ -439,6 +439,7 @@ impl TelemetryRecorder {
             SttObservation::UtteranceEnd {
                 last_word_end_ms,
                 ignored,
+                deferred,
             } => {
                 let delivery_lag_ms = self.delivery_lag_ms(elapsed_ms, *last_word_end_ms);
                 if let Some(delivery_lag_ms) = delivery_lag_ms {
@@ -449,6 +450,8 @@ impl TelemetryRecorder {
                 self.stt.utterance_end += 1;
                 if *ignored {
                     self.stt.ignored_utterance_end += 1;
+                } else if *deferred {
+                    self.stt.deferred_utterance_end += 1;
                 } else {
                     if self.draft_active {
                         self.last_utterance_end_ms = Some(elapsed_ms);
@@ -471,6 +474,7 @@ impl TelemetryRecorder {
                         "last_word_end_ms": last_word_end_ms,
                         "delivery_lag_ms": delivery_lag_ms,
                         "ignored": ignored,
+                        "deferred": deferred,
                     }),
                 )
             }
@@ -793,6 +797,7 @@ struct SttMetrics {
     speech_started: u64,
     utterance_end: u64,
     ignored_utterance_end: u64,
+    deferred_utterance_end: u64,
 }
 
 #[derive(Serialize)]
@@ -1310,6 +1315,7 @@ mod tests {
             .record(&OutputEvent::SttObservation(SttObservation::UtteranceEnd {
                 last_word_end_ms: Some(1_000),
                 ignored: false,
+                deferred: false,
             }))
             .expect("utterance end must be recorded");
         recorder

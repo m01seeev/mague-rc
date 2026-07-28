@@ -397,6 +397,15 @@ const DANGLING_FINAL_WORDS: &[&str] = &[
     "который",
     "которая",
     "которое",
+    "какая",
+    "какие",
+    "каким",
+    "какими",
+    "какого",
+    "какое",
+    "какой",
+    "какую",
+    "каких",
     "либо",
     "между",
     "на",
@@ -425,6 +434,73 @@ const DANGLING_FINAL_WORDS: &[&str] = &[
     "чем",
     "чтобы",
 ];
+
+const DANGLING_FINAL_PHRASES: &[&[&str]] = &[
+    &["в", "каких"],
+    &["в", "каком"],
+    &["для", "того", "чтобы"],
+    &["за", "счет"],
+    &["за", "счёт"],
+    &["и", "какая"],
+    &["и", "какие"],
+    &["и", "какой"],
+    &["и", "какую"],
+    &["если", "у", "нас"],
+    &["потому", "что"],
+];
+
+const REQUEST_WORDS: &[&str] = &[
+    "объясни",
+    "объясните",
+    "опиши",
+    "опишите",
+    "покажи",
+    "покажите",
+    "расскажи",
+    "расскажите",
+    "сравни",
+    "сравните",
+];
+
+const QUESTION_WORDS: &[&str] = &[
+    "где",
+    "зачем",
+    "как",
+    "какая",
+    "какие",
+    "каким",
+    "какими",
+    "какого",
+    "какое",
+    "какой",
+    "какую",
+    "каких",
+    "когда",
+    "почему",
+    "сколько",
+    "чего",
+    "чем",
+    "что",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoundaryDeferral {
+    DanglingSuffix,
+    Introduction,
+    Setup,
+    ShortFragment,
+}
+
+impl BoundaryDeferral {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::DanglingSuffix => "dangling_suffix",
+            Self::Introduction => "introduction",
+            Self::Setup => "setup",
+            Self::ShortFragment => "short_fragment",
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 enum TranscriptCommand {
@@ -568,10 +644,10 @@ fn handle_deepgram_event(
         } if !text.is_empty() => {
             stats.transcripts += 1;
             assembler.push_transcript(&text, is_final);
-            let dangling_word = (is_final && speech_final)
+            let boundary_deferral = (is_final && speech_final)
                 .then(|| assembler.preview())
-                .and_then(|preview| dangling_final_word(&preview));
-            let speech_final_deferred = dangling_word.is_some();
+                .and_then(|preview| boundary_deferral(&preview));
+            let speech_final_deferred = boundary_deferral.is_some();
             send_output(
                 output,
                 OutputEvent::SttObservation(SttObservation::Transcript {
@@ -606,12 +682,12 @@ fn handle_deepgram_event(
             }
             send_transcript_draft(assembler, output)?;
             if is_final && speech_final {
-                if let Some(trailing_word) = dangling_word {
+                if let Some(deferral) = boundary_deferral {
                     debug!(
                         module = "transcript",
                         event = "speech_final_deferred",
-                        trailing_word,
-                        "waiting for utterance end after a dangling final word"
+                        reason = deferral.reason(),
+                        "waiting for more speech after an incomplete boundary"
                     );
                 } else {
                     flush_reason = Some("speech_final");
@@ -634,11 +710,16 @@ fn handle_deepgram_event(
             let ignored = last_word_end_ms.zip(*pending_last_word_end_ms).is_some_and(
                 |(utterance_end_ms, pending_word_end_ms)| utterance_end_ms < pending_word_end_ms,
             );
+            let boundary_deferral = (!ignored)
+                .then(|| assembler.preview())
+                .and_then(|preview| boundary_deferral(&preview));
+            let deferred = boundary_deferral.is_some();
             send_output(
                 output,
                 OutputEvent::SttObservation(SttObservation::UtteranceEnd {
                     last_word_end_ms,
                     ignored,
+                    deferred,
                 }),
             )?;
             if ignored {
@@ -648,6 +729,13 @@ fn handle_deepgram_event(
                     ?last_word_end_ms,
                     ?pending_last_word_end_ms,
                     "ignored utterance end for earlier speech"
+                );
+            } else if let Some(deferral) = boundary_deferral {
+                debug!(
+                    module = "transcript",
+                    event = "utterance_end_deferred",
+                    reason = deferral.reason(),
+                    "keeping an incomplete utterance for the next speech"
                 );
             } else {
                 debug!(
@@ -682,16 +770,88 @@ fn handle_deepgram_event(
     Ok(flush_reason)
 }
 
-fn dangling_final_word(text: &str) -> Option<&'static str> {
-    let word = text
-        .split_whitespace()
-        .next_back()?
-        .trim_matches(|character: char| !character.is_alphanumeric());
-    let normalized = word.to_lowercase();
-    DANGLING_FINAL_WORDS
+fn boundary_deferral(text: &str) -> Option<BoundaryDeferral> {
+    let words = normalized_words(text);
+    if words.is_empty() || ends_with_question_mark(text) {
+        return None;
+    }
+    if DANGLING_FINAL_PHRASES
         .iter()
-        .copied()
-        .find(|candidate| normalized == *candidate)
+        .any(|suffix| ends_with_words(&words, suffix))
+        || words.last().is_some_and(|word| {
+            DANGLING_FINAL_WORDS
+                .iter()
+                .any(|candidate| word == candidate)
+        })
+    {
+        return Some(BoundaryDeferral::DanglingSuffix);
+    }
+    if is_introduction(&words) && !has_request_word(&words) {
+        return Some(BoundaryDeferral::Introduction);
+    }
+    if is_setup(&words) && !has_request_word(&words) {
+        return Some(BoundaryDeferral::Setup);
+    }
+    if words.len() <= 6 && !has_question_signal(&words) {
+        return Some(BoundaryDeferral::ShortFragment);
+    }
+    None
+}
+
+fn normalized_words(text: &str) -> Vec<String> {
+    text.split(|character: char| !character.is_alphanumeric() && character != '-')
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+fn ends_with_words(words: &[String], suffix: &[&str]) -> bool {
+    words.len() >= suffix.len()
+        && words[words.len() - suffix.len()..]
+            .iter()
+            .zip(suffix)
+            .all(|(word, candidate)| word == candidate)
+}
+
+fn ends_with_question_mark(text: &str) -> bool {
+    text.trim_end_matches(|character: char| {
+        character.is_whitespace() || matches!(character, '"' | '\'' | ')' | ']')
+    })
+    .ends_with('?')
+}
+
+fn is_setup(words: &[String]) -> bool {
+    words
+        .iter()
+        .any(|word| matches!(word.as_str(), "допустим" | "предположим" | "представим"))
+        || contains_words(words, &["у", "нас", "есть"])
+}
+
+fn is_introduction(words: &[String]) -> bool {
+    words.iter().any(|word| word == "давайте")
+        && words
+            .iter()
+            .any(|word| matches!(word.as_str(), "начнем" | "начнём" | "начнемте" | "начнёмте"))
+}
+
+fn contains_words(words: &[String], needle: &[&str]) -> bool {
+    words.len() >= needle.len()
+        && words
+            .windows(needle.len())
+            .any(|window| ends_with_words(window, needle))
+}
+
+fn has_request_word(words: &[String]) -> bool {
+    words
+        .iter()
+        .any(|word| REQUEST_WORDS.iter().any(|candidate| word == candidate))
+}
+
+fn has_question_signal(words: &[String]) -> bool {
+    has_request_word(words)
+        || words
+            .iter()
+            .any(|word| QUESTION_WORDS.iter().any(|candidate| word == candidate))
 }
 
 fn handle_stt_status(
@@ -985,7 +1145,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dangling_speech_final_waits_for_utterance_end() {
+    async fn dangling_text_survives_utterance_end_and_joins_continuation() {
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
         let (request_sender, mut request_receiver) = llm_request_channel(0);
         let (output_sender, mut output_receiver) = mpsc::unbounded_channel();
@@ -1006,6 +1166,16 @@ mod tests {
                 last_word_end_ms: Some(900),
             })
             .expect("utterance end must send");
+        event_sender
+            .send(DeepgramEvent::Transcript {
+                text: "ConcurrentHashMap обеспечивает потокобезопасность?".to_owned(),
+                is_final: true,
+                speech_final: true,
+                audio_start_ms: Some(2_000),
+                audio_duration_ms: Some(1_000),
+                last_word_end_ms: Some(2_900),
+            })
+            .expect("continuation must send");
         drop(event_sender);
 
         let stats = run_transcript_windows(
@@ -1027,13 +1197,14 @@ mod tests {
             request_receiver
                 .recv()
                 .await
-                .expect("utterance end must queue the deferred question")
+                .expect("continuation must queue the completed question")
                 .text,
-            "Расскажите, за счет чего"
+            "Расскажите, за счет чего ConcurrentHashMap обеспечивает потокобезопасность?"
         );
         assert_eq!(request_receiver.recv().await, None);
 
         let mut deferred = false;
+        let mut utterance_end_deferred = false;
         let mut flush_reason = None;
         while let Ok(event) = output_receiver.try_recv() {
             match event {
@@ -1041,6 +1212,9 @@ mod tests {
                     speech_final_deferred,
                     ..
                 }) => deferred |= speech_final_deferred,
+                OutputEvent::SttObservation(SttObservation::UtteranceEnd { deferred, .. }) => {
+                    utterance_end_deferred |= deferred
+                }
                 OutputEvent::Transcript(transcript) => {
                     flush_reason = Some(transcript.flush_reason);
                 }
@@ -1048,7 +1222,8 @@ mod tests {
             }
         }
         assert!(deferred);
-        assert_eq!(flush_reason.as_deref(), Some("utterance_end"));
+        assert!(utterance_end_deferred);
+        assert_eq!(flush_reason.as_deref(), Some("speech_final"));
     }
 
     #[tokio::test]
@@ -1339,6 +1514,7 @@ mod tests {
                 OutputEvent::SttObservation(SttObservation::UtteranceEnd {
                     last_word_end_ms: Some(3_100),
                     ignored: true,
+                    deferred: false,
                 })
             );
         }
@@ -1422,14 +1598,40 @@ mod tests {
     }
 
     #[test]
-    fn detects_only_obviously_dangling_final_words() {
+    fn classifies_only_suspicious_boundaries_as_incomplete() {
         assert_eq!(
-            dangling_final_word("Расскажите, за счет ЧЕГО..."),
-            Some("чего")
+            boundary_deferral("Расскажите, за счет ЧЕГО..."),
+            Some(BoundaryDeferral::DanglingSuffix)
         );
-        assert_eq!(dangling_final_word("В чем разница между"), Some("между"));
-        assert_eq!(dangling_final_word("Что такое HashMap?"), None);
-        assert_eq!(dangling_final_word("Что произойдет после?"), None);
+        assert_eq!(
+            boundary_deferral("Какие операции выполняются и какие"),
+            Some(BoundaryDeferral::DanglingSuffix)
+        );
+        assert_eq!(
+            boundary_deferral("Если у нас"),
+            Some(BoundaryDeferral::DanglingSuffix)
+        );
+        assert_eq!(
+            boundary_deferral("Представим, что два приложения обновляют запись."),
+            Some(BoundaryDeferral::Setup)
+        );
+        assert_eq!(
+            boundary_deferral("Так, ну, давайте, наверное, начнём со Spring Boot."),
+            Some(BoundaryDeferral::Introduction)
+        );
+        assert_eq!(
+            boundary_deferral("Хорошо, теперь Java."),
+            Some(BoundaryDeferral::ShortFragment)
+        );
+        assert_eq!(
+            boundary_deferral("В чем разница между"),
+            Some(BoundaryDeferral::DanglingSuffix)
+        );
+        assert_eq!(boundary_deferral("Что такое HashMap?"), None);
+        assert_eq!(boundary_deferral("Что произойдет после?"), None);
+        assert_eq!(boundary_deferral("И что?"), None);
+        assert_eq!(boundary_deferral("Между чем?"), None);
+        assert_eq!(boundary_deferral("Расскажите о Java."), None);
     }
 
     #[tokio::test]

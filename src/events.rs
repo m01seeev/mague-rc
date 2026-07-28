@@ -114,6 +114,7 @@ pub enum SttObservation {
     UtteranceEnd {
         last_word_end_ms: Option<u64>,
         ignored: bool,
+        deferred: bool,
     },
 }
 
