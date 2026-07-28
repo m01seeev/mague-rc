@@ -99,6 +99,17 @@ cargo run -- --benchmark benchmark.wav utterance-end-01 --reference benchmark.ex
 
 Do not treat a run with `"git_dirty": true` as a reproducible result. Three questions are useful for functional iteration, but latency conclusions should be based on several repeated runs and preferably a larger fixed corpus.
 
+The local six-file corpus keeps audio artifacts out of Git while tracking one three-question reference file per recording:
+
+| Audio | Reference | Coverage |
+| --- | --- | --- |
+| `benchmark_human.wav` | `benchmark_human.expected.txt` | Natural baseline |
+| `benchmark_dangling.wav` | `benchmark_dangling.expected.txt` | Pauses after dangling words |
+| `benchmark_dangling_complete.wav` | `benchmark_dangling_complete.expected.txt` | Valid questions ending in guarded words |
+| `benchmark_expressive.wav` | `benchmark_expressive.expected.txt` | Non-verbal sounds and quiet delivery |
+| `benchmark_disfluent.wav` | `benchmark_disfluent.expected.txt` | Fillers, corrections, and broken delivery |
+| `benchmark_technical.wav` | `benchmark_technical.expected.txt` | Dense English technical terminology |
+
 The process validates configuration, starts `ffmpeg`, and reads raw PCM from the configured PulseAudio-compatible source. PCM frames are streamed to Deepgram over an authenticated WebSocket and are not written to disk. Interim recognition is shown in the overlay immediately. A question is submitted when Deepgram emits `speech_final` or `UtteranceEnd`; `TRANSCRIPT_WINDOW_SEC` is only an inactivity fallback when neither boundary arrives. A `speech_final` ending in an obviously dangling Russian conjunction, preposition, or relative word is deferred until speech continues or `UtteranceEnd` confirms the pause. An unfinalized interim transcript receives one additional fallback window before submission so a short provider stall does not split a question. Text shorter than `MIN_UTTERANCE_CHARS` is discarded at a boundary.
 
 Each completed utterance enters a sequential OpenRouter queue. Responses stream under an `ANSWER #<id> [voice]` heading, and the next request starts only after the current response completes or fails. Successful user/assistant pairs are retained up to `MAX_HISTORY_PAIRS`; failed and timed-out responses are not added to history. `TEXT_TIMEOUT_SEC`, `TEXT_TEMPERATURE`, and `TEXT_MAX_TOKENS` control the text model request.

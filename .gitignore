@@ -2,4 +2,5 @@
 .env
 *.log
 /benchmark*.wav
+/benchmark*.mp3
 /telemetry/
