@@ -48,7 +48,7 @@ Environment variables override values loaded from `.env`. The default tracing le
 cargo run
 ```
 
-This opens a GTK4 layer-shell panel centered along the top edge of the active output. The panel stays above regular windows without taking keyboard focus and keeps a scrollable history of questions and streaming answers. Its controls pause/resume recognition, clear the visible and LLM conversation history, collapse/expand the panel, and shut the pipeline down cleanly. Pausing prevents new questions and answers while keeping audio capture and the Deepgram connection alive.
+This opens a GTK4 layer-shell panel centered along the top edge of the active output. The panel stays above regular windows without taking keyboard focus and keeps a scrollable history of questions and streaming answers. Its controls pause/resume recognition, clear the visible and LLM conversation history, collapse/expand the panel, and shut the pipeline down cleanly. Pausing prevents new questions and answers while keeping audio capture and the Deepgram connection alive. The overlay also toggles between its full and collapsed sizes on `SIGUSR2`; its PID is written to `/tmp/mague-rc-overlay.pid` for a compositor hotkey.
 
 For the diagnostic terminal output instead:
 

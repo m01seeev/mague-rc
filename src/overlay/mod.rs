@@ -1,5 +1,8 @@
 use std::{
     cell::{Cell, RefCell},
+    fs, io,
+    path::PathBuf,
+    process,
     rc::Rc,
     sync::mpsc,
     thread,
@@ -31,14 +34,22 @@ const WIDTH: i32 = 760;
 const HEIGHT: i32 = 600;
 const COLLAPSED_WIDTH: i32 = 420;
 const COLLAPSED_HEIGHT: i32 = 52;
+const CONTROL_PID_FILE: &str = "/tmp/mague-rc-overlay.pid";
 
 #[derive(Debug, Error)]
 pub enum OverlayError {
+    #[error("could not write overlay control PID file `{path}`: {source}")]
+    ControlPidFile {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     #[error("GTK application exited with status {0}")]
     Exit(i32),
 }
 
 pub fn run(config: Config) -> Result<(), OverlayError> {
+    let _pid_file = OverlayPidFile::create()?;
     let application = Application::new(Some(APPLICATION_ID), gio::ApplicationFlags::NON_UNIQUE);
 
     application.connect_startup(|_| install_css());
@@ -52,6 +63,37 @@ pub fn run(config: Config) -> Result<(), OverlayError> {
     } else {
         Err(OverlayError::Exit(exit_code))
     }
+}
+
+struct OverlayPidFile {
+    path: PathBuf,
+    pid: u32,
+}
+
+impl OverlayPidFile {
+    fn create() -> Result<Self, OverlayError> {
+        let path = control_pid_path();
+        let pid = process::id();
+        fs::write(&path, pid.to_string()).map_err(|source| OverlayError::ControlPidFile {
+            path: path.clone(),
+            source,
+        })?;
+        Ok(Self { path, pid })
+    }
+}
+
+impl Drop for OverlayPidFile {
+    fn drop(&mut self) {
+        let owns_file = fs::read_to_string(&self.path)
+            .is_ok_and(|contents| contents.trim() == self.pid.to_string());
+        if owns_file {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn control_pid_path() -> PathBuf {
+    PathBuf::from(CONTROL_PID_FILE)
 }
 
 struct OverlayState {
@@ -133,6 +175,7 @@ struct OverlayWidgets {
     history: ConversationHistoryWidgets,
     footer: Label,
     queue: Label,
+    collapse_button: Button,
     collapse_icon: Image,
     body: GtkBox,
 }
@@ -432,6 +475,7 @@ fn create_widgets(application: &Application, state: Rc<RefCell<OverlayState>>) -
         },
         footer,
         queue,
+        collapse_button: collapse_button.clone(),
         collapse_icon,
         body: body.clone(),
     };
@@ -439,26 +483,11 @@ fn create_widgets(application: &Application, state: Rc<RefCell<OverlayState>>) -
     {
         let state = Rc::clone(&state);
         let widgets = widgets.clone();
-        collapse_button.connect_clicked(move |button| {
-            let mut state = state.borrow_mut();
-            state.collapsed = !state.collapsed;
-            if state.collapsed {
-                widgets.body.set_visible(false);
-                widgets
-                    .window
-                    .set_default_size(COLLAPSED_WIDTH, COLLAPSED_HEIGHT);
-                widgets
-                    .collapse_icon
-                    .set_icon_name(Some("go-down-symbolic"));
-                button.set_tooltip_text(Some("Expand"));
-            } else {
-                widgets.window.set_default_size(WIDTH, HEIGHT);
-                widgets.body.set_visible(true);
-                widgets.collapse_icon.set_icon_name(Some("go-up-symbolic"));
-                button.set_tooltip_text(Some("Collapse"));
-            }
+        collapse_button.connect_clicked(move |_| {
+            toggle_collapsed(&state, &widgets);
         });
     }
+    listen_for_toggle_signal(Rc::clone(&state), widgets.clone());
 
     let state_for_close = Rc::clone(&state);
     let status_for_close = status_label.clone();
@@ -474,6 +503,81 @@ fn create_widgets(application: &Application, state: Rc<RefCell<OverlayState>>) -
     });
 
     widgets
+}
+
+fn listen_for_toggle_signal(state: Rc<RefCell<OverlayState>>, widgets: OverlayWidgets) {
+    let (signal_sender, mut signal_receiver) = futures_channel::mpsc::unbounded();
+    let spawn_result = thread::Builder::new()
+        .name(String::from("mague-rc-overlay-control"))
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            let Ok(runtime) = runtime else {
+                tracing::error!("could not create overlay control runtime");
+                return;
+            };
+            runtime.block_on(async move {
+                let signal = tokio::signal::unix::signal(
+                    tokio::signal::unix::SignalKind::user_defined2(),
+                );
+                let Ok(mut signal) = signal else {
+                    tracing::error!("could not install overlay toggle signal handler");
+                    return;
+                };
+                while signal.recv().await.is_some() {
+                    if signal_sender.unbounded_send(()).is_err() {
+                        break;
+                    }
+                }
+            });
+        });
+
+    if let Err(error) = spawn_result {
+        state
+            .borrow_mut()
+            .apply_output(&OutputEvent::Error(AppErrorView {
+                component: OutputComponent::App,
+                message: format!("could not start overlay control: {error}"),
+            }));
+        refresh_widgets(&state.borrow(), &widgets);
+        return;
+    }
+
+    glib::spawn_future_local(async move {
+        while signal_receiver.next().await.is_some() {
+            toggle_collapsed(&state, &widgets);
+        }
+    });
+}
+
+fn toggle_collapsed(state: &Rc<RefCell<OverlayState>>, widgets: &OverlayWidgets) {
+    let collapsed = {
+        let mut state = state.borrow_mut();
+        state.collapsed = !state.collapsed;
+        state.collapsed
+    };
+    widgets.body.set_visible(!collapsed);
+    if collapsed {
+        widgets
+            .window
+            .set_default_size(COLLAPSED_WIDTH, COLLAPSED_HEIGHT);
+        widgets
+            .collapse_icon
+            .set_icon_name(Some("go-down-symbolic"));
+        widgets
+            .collapse_button
+            .set_tooltip_text(Some("Expand"));
+    } else {
+        widgets.window.set_default_size(WIDTH, HEIGHT);
+        widgets.body.set_visible(true);
+        widgets
+            .collapse_icon
+            .set_icon_name(Some("go-up-symbolic"));
+        widgets
+            .collapse_button
+            .set_tooltip_text(Some("Collapse"));
+    }
 }
 
 fn icon_button(icon_name: &str, tooltip: &str) -> Button {
