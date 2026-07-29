@@ -43,9 +43,27 @@ impl ChatMessage {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
+    pub temperature: Option<f32>,
+    pub max_tokens: Option<u32>,
+}
+
+impl ChatRequest {
+    pub fn new(messages: Vec<ChatMessage>) -> Self {
+        Self {
+            messages,
+            temperature: None,
+            max_tokens: None,
+        }
+    }
+
+    pub fn with_generation_options(mut self, temperature: f32, max_tokens: u32) -> Self {
+        self.temperature = Some(temperature);
+        self.max_tokens = Some(max_tokens);
+        self
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

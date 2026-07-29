@@ -7,10 +7,15 @@ use tracing::{debug, info, warn};
 
 use crate::{
     config::LlmConfig,
-    events::{AnswerMeta, AppErrorView, LlmCommand, LlmRequest, OutputComponent, OutputEvent},
+    events::{
+        AnswerMeta, AppErrorView, LiveCodingState, LlmCommand, LlmRequest, Mode, OutputComponent,
+        OutputEvent,
+    },
     llm::{
         ChatMessage, ChatRequest, ConversationHistories, LlmError, LlmRequestReceiver,
-        LlmStreamEvent, TextLlmProvider, knowledge_context_prompt, voice_system_prompt,
+        LlmStreamEvent, TextLlmProvider, knowledge_context_prompt, live_coding_system_prompt,
+        live_coding_user_prompt, parse_live_coding_response, voice_system_prompt,
+        voice_user_prompt,
     },
 };
 
@@ -31,6 +36,7 @@ pub struct LlmWorker<P> {
     provider: P,
     config: LlmConfig,
     histories: ConversationHistories,
+    live_coding: LiveCodingState,
 }
 
 impl<P> LlmWorker<P>
@@ -44,6 +50,7 @@ where
             provider,
             config,
             histories,
+            live_coding: LiveCodingState::default(),
         }
     }
 
@@ -63,10 +70,15 @@ where
                     match command {
                         Some(LlmCommand::ClearHistory) => {
                             self.histories.clear();
+                            self.live_coding = LiveCodingState::default();
+                            send_event(
+                                &events,
+                                OutputEvent::LiveCodingUpdated(self.live_coding.clone()),
+                            )?;
                             info!(
                                 module = "llm",
                                 event = "history_cleared",
-                                "LLM histories cleared"
+                                "LLM histories and live-coding state cleared"
                             );
                         }
                         None => commands_open = false,
@@ -86,6 +98,7 @@ where
                 OutputEvent::AnswerStarted(AnswerMeta {
                     request_id: request.request_id,
                     mode: request.mode,
+                    speaker: request.speaker,
                 }),
             )?;
 
@@ -94,6 +107,7 @@ where
                 event = "request_started",
                 request_id = request.request_id,
                 mode = %request.mode,
+                speaker = %request.speaker,
                 queue_len,
                 provider = "openrouter",
                 model = %self.config.model,
@@ -101,9 +115,23 @@ where
             );
 
             match self.process_request(&request, &events).await {
-                Ok(full_text) => {
-                    self.histories
-                        .record(request.mode, request.text.clone(), full_text.clone());
+                Ok(ProcessedResponse::Conversation(full_text)) => {
+                    self.histories.record(
+                        request.mode,
+                        voice_user_prompt(request.speaker, &request.text),
+                        full_text,
+                    );
+                    stats.completed += 1;
+                    send_event(
+                        &events,
+                        OutputEvent::AnswerCompleted {
+                            request_id: request.request_id,
+                        },
+                    )?;
+                }
+                Ok(ProcessedResponse::LiveCoding(updated)) => {
+                    self.live_coding = updated.clone();
+                    send_event(&events, OutputEvent::LiveCodingUpdated(updated))?;
                     stats.completed += 1;
                     send_event(
                         &events,
@@ -119,6 +147,7 @@ where
                         event = "request_failed",
                         request_id = request.request_id,
                         mode = %request.mode,
+                        speaker = %request.speaker,
                         provider = "openrouter",
                         model = %self.config.model,
                         error = %error,
@@ -142,7 +171,33 @@ where
         &self,
         request: &LlmRequest,
         events: &mpsc::UnboundedSender<OutputEvent>,
-    ) -> Result<String, LlmError> {
+    ) -> Result<ProcessedResponse, LlmError> {
+        if request.mode == Mode::LiveCoding {
+            let messages = vec![
+                ChatMessage::system(live_coding_system_prompt()),
+                ChatMessage::user(live_coding_user_prompt(
+                    &self.live_coding,
+                    request.speaker,
+                    &request.text,
+                )),
+            ];
+            let chat_request = ChatRequest::new(messages).with_generation_options(
+                self.config.coding_temperature,
+                self.config.coding_max_tokens,
+            );
+            let raw_response = self
+                .complete_request(
+                    request,
+                    chat_request,
+                    events,
+                    false,
+                    Duration::from_secs(self.config.coding_timeout_sec),
+                )
+                .await?;
+            return parse_live_coding_response(&self.live_coding, request.speaker, &raw_response)
+                .map(ProcessedResponse::LiveCoding);
+        }
+
         let history = self.histories.messages(request.mode);
         let mut messages = Vec::with_capacity(2 + history.len());
         messages.push(ChatMessage::system(voice_system_prompt(
@@ -152,13 +207,34 @@ where
         if let Some(knowledge) = request.knowledge.as_ref() {
             messages.push(ChatMessage::system(knowledge_context_prompt(knowledge)));
         }
-        messages.push(ChatMessage::user(request.text.clone()));
+        messages.push(ChatMessage::user(voice_user_prompt(
+            request.speaker,
+            &request.text,
+        )));
+        let full_text = self
+            .complete_request(
+                request,
+                ChatRequest::new(messages),
+                events,
+                true,
+                Duration::from_secs(self.config.timeout_sec),
+            )
+            .await?;
+        Ok(ProcessedResponse::Conversation(full_text))
+    }
 
+    async fn complete_request(
+        &self,
+        request: &LlmRequest,
+        chat_request: ChatRequest,
+        events: &mpsc::UnboundedSender<OutputEvent>,
+        emit_deltas: bool,
+        timeout_duration: Duration,
+    ) -> Result<String, LlmError> {
         let started_at = Instant::now();
         let mut first_token_at = None;
         let mut full_text = String::new();
-        let mut stream = self.provider.stream(ChatRequest { messages });
-        let timeout_duration = Duration::from_secs(self.config.timeout_sec);
+        let mut stream = self.provider.stream(chat_request);
         let deadline = sleep(timeout_duration);
         tokio::pin!(deadline);
 
@@ -175,6 +251,7 @@ where
                                 event = "first_token",
                                 request_id = request.request_id,
                                 mode = %request.mode,
+                                speaker = %request.speaker,
                                 latency_ms = latency.as_millis(),
                                 provider = "openrouter",
                                 model = %self.config.model,
@@ -182,14 +259,16 @@ where
                             );
                         }
                         full_text.push_str(&delta);
-                        send_event(
-                            events,
-                            OutputEvent::AnswerDelta {
-                                request_id: request.request_id,
-                                text: delta,
-                            },
-                        )
-                        .map_err(|_| LlmError::Request("output channel closed".to_owned()))?;
+                        if emit_deltas {
+                            send_event(
+                                events,
+                                OutputEvent::AnswerDelta {
+                                    request_id: request.request_id,
+                                    text: delta,
+                                },
+                            )
+                            .map_err(|_| LlmError::Request("output channel closed".to_owned()))?;
+                        }
                     }
                     Some(Ok(LlmStreamEvent::Usage(usage))) => {
                         send_event(
@@ -217,6 +296,7 @@ where
             event = "request_completed",
             request_id = request.request_id,
             mode = %request.mode,
+            speaker = %request.speaker,
             latency_ms = started_at.elapsed().as_millis(),
             provider = "openrouter",
             model = %self.config.model,
@@ -224,6 +304,11 @@ where
         );
         Ok(full_text)
     }
+}
+
+enum ProcessedResponse {
+    Conversation(String),
+    LiveCoding(LiveCodingState),
 }
 
 fn send_event(
@@ -244,7 +329,7 @@ mod tests {
 
     use crate::{
         config::SecretString,
-        events::Mode,
+        events::{Mode, Speaker},
         llm::{ChatRole, LlmStreamEvent, TextStream, llm_request_channel},
     };
 
@@ -283,6 +368,9 @@ mod tests {
             temperature: 0.2,
             max_tokens: 450,
             timeout_sec: 1,
+            coding_temperature: 0.1,
+            coding_max_tokens: 1_800,
+            coding_timeout_sec: 2,
             current_project: "АО Консалт Плюс".to_owned(),
         }
     }
@@ -291,6 +379,7 @@ mod tests {
         LlmRequest {
             request_id,
             mode: Mode::Voice,
+            speaker: Speaker::Interviewer,
             text: format!("question {request_id}"),
             knowledge: None,
         }
@@ -331,7 +420,10 @@ mod tests {
         assert_eq!(requests[0].messages.len(), 2);
         assert_eq!(requests[1].messages.len(), 4);
         assert_eq!(requests[1].messages[1].role, ChatRole::User);
-        assert_eq!(requests[1].messages[1].content, "question 1");
+        assert_eq!(
+            requests[1].messages[1].content,
+            "<SPEECH speaker=\"interviewer\">\nquestion 1\n</SPEECH>"
+        );
         assert_eq!(requests[1].messages[2].role, ChatRole::Assistant);
         assert_eq!(requests[1].messages[2].content, "answer 1 done");
     }

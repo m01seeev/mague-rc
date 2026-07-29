@@ -1,4 +1,6 @@
-use crate::events::{AppErrorView, OutputComponent, OutputEvent, QueueKind, StatusKind};
+use crate::events::{
+    AppErrorView, Mode, OutputComponent, OutputEvent, QueueKind, Speaker, StatusKind,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ConnectionStatus {
@@ -30,6 +32,7 @@ pub enum AnswerStatus {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConversationTurn {
     pub request_id: u64,
+    pub speaker: Speaker,
     pub question: String,
     pub answer: String,
     pub answer_status: AnswerStatus,
@@ -37,6 +40,7 @@ pub struct ConversationTurn {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AppSnapshot {
+    pub mode: Mode,
     pub running: bool,
     pub listening: bool,
     pub stt_status: ConnectionStatus,
@@ -54,6 +58,7 @@ pub struct AppSnapshot {
 impl AppSnapshot {
     pub fn apply(&mut self, event: &OutputEvent) {
         match event {
+            OutputEvent::ModeChanged { mode } => self.mode = *mode,
             OutputEvent::Status(status) => match status.kind {
                 StatusKind::Started => {
                     self.running = true;
@@ -87,10 +92,14 @@ impl AppSnapshot {
                     self.llm_status = WorkerStatus::Idle;
                 }
             },
-            OutputEvent::TranscriptDraft { text } => {
+            OutputEvent::TranscriptDraft {
+                speaker: Speaker::Interviewer,
+                text,
+            } => {
                 self.transcript_draft.clone_from(text);
             }
-            OutputEvent::Transcript(transcript) => {
+            OutputEvent::TranscriptDraft { .. } => {}
+            OutputEvent::Transcript(transcript) if transcript.mode != Mode::LiveCoding => {
                 self.current_transcript.clone_from(&transcript.text);
                 if let Some(turn) = self
                     .conversation
@@ -101,12 +110,14 @@ impl AppSnapshot {
                 } else {
                     self.conversation.push(ConversationTurn {
                         request_id: transcript.sequence,
+                        speaker: transcript.speaker,
                         question: transcript.text.clone(),
                         answer: String::new(),
                         answer_status: AnswerStatus::Pending,
                     });
                 }
             }
+            OutputEvent::Transcript(_) => {}
             OutputEvent::AnswerStarted(meta) => {
                 self.llm_status = WorkerStatus::Working;
                 self.current_answer_id = Some(meta.request_id);
@@ -147,10 +158,11 @@ impl AppSnapshot {
                 }
             }
             OutputEvent::AnswerCompleted { .. } => {}
-            OutputEvent::SttObservation(_)
+            OutputEvent::SttObservation { .. }
             | OutputEvent::Retrieval(_)
             | OutputEvent::LlmQueued { .. }
-            | OutputEvent::AnswerUsage { .. } => {}
+            | OutputEvent::AnswerUsage { .. }
+            | OutputEvent::LiveCodingUpdated(_) => {}
             OutputEvent::QueueState(queue) => match queue.queue {
                 QueueKind::Audio => self.audio_queue_len = queue.len,
                 QueueKind::Llm => self.llm_queue_len = queue.len,
@@ -183,7 +195,8 @@ impl AppSnapshot {
 #[cfg(test)]
 mod tests {
     use crate::events::{
-        AnswerMeta, AppErrorView, Mode, OutputComponent, QueueState, StatusMessage, TranscriptView,
+        AnswerMeta, AppErrorView, Mode, OutputComponent, QueueState, Speaker, StatusMessage,
+        TranscriptView,
     };
 
     use super::*;
@@ -202,12 +215,15 @@ mod tests {
         }));
         snapshot.apply(&OutputEvent::Transcript(TranscriptView {
             sequence: 4,
+            mode: Mode::Voice,
+            speaker: Speaker::Interviewer,
             text: "Что такое ownership?".to_owned(),
             flush_reason: "test".to_owned(),
         }));
         snapshot.apply(&OutputEvent::AnswerStarted(AnswerMeta {
             request_id: 4,
             mode: Mode::Voice,
+            speaker: Speaker::Interviewer,
         }));
         snapshot.apply(&OutputEvent::AnswerDelta {
             request_id: 4,
@@ -237,6 +253,7 @@ mod tests {
             snapshot.conversation,
             vec![ConversationTurn {
                 request_id: 4,
+                speaker: Speaker::Interviewer,
                 question: "Что такое ownership?".to_owned(),
                 answer: "Ownership управляет временем жизни данных.".to_owned(),
                 answer_status: AnswerStatus::Completed,
@@ -249,12 +266,15 @@ mod tests {
         let mut snapshot = AppSnapshot::default();
         snapshot.apply(&OutputEvent::Transcript(TranscriptView {
             sequence: 8,
+            mode: Mode::Voice,
+            speaker: Speaker::Interviewer,
             text: "Что такое borrow checker?".to_owned(),
             flush_reason: "test".to_owned(),
         }));
         snapshot.apply(&OutputEvent::AnswerStarted(AnswerMeta {
             request_id: 8,
             mode: Mode::Voice,
+            speaker: Speaker::Interviewer,
         }));
         snapshot.apply(&OutputEvent::AnswerDelta {
             request_id: 7,
@@ -281,21 +301,27 @@ mod tests {
     fn tracks_queued_turns_by_request_id_and_clears_them() {
         let mut snapshot = AppSnapshot::default();
         snapshot.apply(&OutputEvent::TranscriptDraft {
+            speaker: Speaker::Interviewer,
             text: "Черновик".to_owned(),
         });
         snapshot.apply(&OutputEvent::Transcript(TranscriptView {
             sequence: 1,
+            mode: Mode::Voice,
+            speaker: Speaker::Interviewer,
             text: "Первый вопрос".to_owned(),
             flush_reason: "test".to_owned(),
         }));
         snapshot.apply(&OutputEvent::Transcript(TranscriptView {
             sequence: 2,
+            mode: Mode::Voice,
+            speaker: Speaker::Interviewer,
             text: "Второй вопрос".to_owned(),
             flush_reason: "test".to_owned(),
         }));
         snapshot.apply(&OutputEvent::AnswerStarted(AnswerMeta {
             request_id: 1,
             mode: Mode::Voice,
+            speaker: Speaker::Interviewer,
         }));
         snapshot.apply(&OutputEvent::AnswerDelta {
             request_id: 1,

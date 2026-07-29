@@ -16,7 +16,8 @@ use crate::{
     events::{
         AppCommand, AppErrorView, DeepgramEvent, KnowledgeContext, KnowledgeSnippet, LlmCommand,
         LlmRequest, Mode, OutputComponent, OutputEvent, QueueKind, QueueState, RetrievalView,
-        StatusKind, StatusMessage, SttObservation, SttStatus, TranscriptChunk, TranscriptView,
+        Speaker, StatusKind, StatusMessage, SttObservation, SttStatus, TranscriptChunk,
+        TranscriptView,
     },
     knowledge::{
         KnowledgeSearchRequest, KnowledgeSearchResult, KnowledgeWorkerStats, spawn_knowledge_worker,
@@ -32,6 +33,7 @@ use crate::{
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const BENCHMARK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(300);
 const BENCHMARK_EOF_DRAIN: Duration = Duration::from_secs(3);
+const CANDIDATE_REQUEST_ID_BIT: u64 = 1 << 63;
 
 #[derive(Clone, Debug, Default)]
 pub struct RunOptions {
@@ -71,11 +73,17 @@ where
         |path| path.display().to_string(),
     );
     let benchmark_mode = options.audio_file.is_some();
+    let candidate_source_label = if config.candidate_audio.enabled && !benchmark_mode {
+        config.candidate_audio.source.as_str()
+    } else {
+        "disabled"
+    };
 
     info!(
         module = "app",
         event = "started",
         audio_source = %audio_source_label,
+        candidate_source = %candidate_source_label,
         stt_model = %config.deepgram.model,
         llm_model = %config.llm.model,
         transcript_segmentation = "deepgram_utterance",
@@ -89,17 +97,27 @@ where
     let (output_sender, output_receiver) = mpsc::unbounded_channel::<OutputEvent>();
     let (llm_command_sender, llm_command_receiver) = mpsc::unbounded_channel::<LlmCommand>();
     let (transcript_command_sender, transcript_command_receiver) = mpsc::unbounded_channel();
+    let (candidate_command_sender, candidate_command_receiver) = mpsc::unbounded_channel();
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
+    let mut active_mode = Mode::Voice;
+    let candidate_enabled = config.candidate_audio.enabled && !benchmark_mode;
 
     send_output(
         &output_sender,
         OutputEvent::Status(StatusMessage {
             kind: StatusKind::Started,
             text: format!(
-                "source={} | STT={} | LLM={}",
-                audio_source_label, config.deepgram.model, config.llm.model
+                "interviewer={} | candidate={} | STT={} | LLM={}",
+                audio_source_label,
+                candidate_source_label,
+                config.deepgram.model,
+                config.llm.model
             ),
         }),
+    )?;
+    send_output(
+        &output_sender,
+        OutputEvent::ModeChanged { mode: active_mode },
     )?;
 
     let (retrieval, knowledge_task) = if config.knowledge.enabled {
@@ -168,22 +186,67 @@ where
         tokio::spawn(stt_provider.run_with_readiness(
             frame_receiver,
             stt_event_sender,
-            shutdown_receiver,
+            shutdown_receiver.clone(),
             readiness_sender,
         ))
     } else {
         drop(readiness_sender);
-        tokio::spawn(stt_provider.run(frame_receiver, stt_event_sender, shutdown_receiver))
+        tokio::spawn(stt_provider.run(
+            frame_receiver,
+            stt_event_sender,
+            shutdown_receiver.clone(),
+        ))
     };
     let mut transcript_task = tokio::spawn(run_transcript_windows_with_retrieval(
         stt_event_receiver,
-        llm_request_sender,
+        llm_request_sender.clone(),
         output_sender.clone(),
         transcript_command_receiver,
-        config.transcript,
+        config.transcript.clone(),
         transcript_readiness,
+        Speaker::Interviewer,
         retrieval,
     ));
+    let mut candidate_audio_task = None;
+    let mut candidate_stt_task = None;
+    let mut candidate_transcript_task = None;
+    let mut candidate_frame_sender_guard = None;
+    if candidate_enabled {
+        let (candidate_frame_sender, candidate_frame_receiver) =
+            audio_frame_channel(config.audio.queue_max);
+        let (candidate_event_sender, candidate_event_receiver) = mpsc::unbounded_channel();
+        let mut candidate_audio_config = config.audio.clone();
+        candidate_audio_config.source = config.candidate_audio.source.clone();
+        let candidate_audio_source = FfmpegAudioSource::new(
+            candidate_audio_config,
+            config.deepgram.sample_rate,
+            config.deepgram.channels,
+        );
+        let candidate_stt_provider = DeepgramSttProvider::new(config.deepgram.clone());
+        candidate_frame_sender_guard = Some(candidate_frame_sender.clone());
+        candidate_audio_task = Some(tokio::spawn(candidate_audio_source.run(
+            candidate_frame_sender,
+            shutdown_receiver.clone(),
+        )));
+        candidate_stt_task = Some(tokio::spawn(candidate_stt_provider.run(
+            candidate_frame_receiver,
+            candidate_event_sender,
+            shutdown_receiver.clone(),
+        )));
+        candidate_transcript_task = Some(tokio::spawn(run_transcript_windows_with_retrieval(
+            candidate_event_receiver,
+            llm_request_sender,
+            output_sender.clone(),
+            candidate_command_receiver,
+            config.transcript,
+            None,
+            Speaker::Candidate,
+            None,
+        )));
+    } else {
+        drop(candidate_command_receiver);
+        drop(llm_request_sender);
+    }
     let mut llm_task = tokio::spawn(llm_worker.run(
         llm_request_receiver,
         llm_command_receiver,
@@ -194,6 +257,9 @@ where
     let mut audio_completed = None;
     let mut stt_completed = None;
     let mut transcript_completed = None;
+    let mut candidate_audio_completed = None;
+    let mut candidate_stt_completed = None;
+    let mut candidate_transcript_completed = None;
     let mut llm_completed = None;
     let mut output_completed = None;
 
@@ -218,6 +284,13 @@ where
                         {
                             break StopReason::Transcript;
                         }
+                        if candidate_enabled
+                            && candidate_command_sender
+                                .send(TranscriptCommand::SetPaused(true))
+                                .is_err()
+                        {
+                            break StopReason::CandidateTranscript;
+                        }
                         if output_sender
                             .send(OutputEvent::Status(StatusMessage {
                                 kind: StatusKind::Paused,
@@ -235,6 +308,13 @@ where
                         {
                             break StopReason::Transcript;
                         }
+                        if candidate_enabled
+                            && candidate_command_sender
+                                .send(TranscriptCommand::SetPaused(false))
+                                .is_err()
+                        {
+                            break StopReason::CandidateTranscript;
+                        }
                         if output_sender
                             .send(OutputEvent::Status(StatusMessage {
                                 kind: StatusKind::Listening,
@@ -244,6 +324,38 @@ where
                         {
                             break StopReason::Output;
                         }
+                    }
+                    Some(AppCommand::ToggleLiveCoding) => {
+                        active_mode = if active_mode == Mode::LiveCoding {
+                            Mode::Voice
+                        } else {
+                            Mode::LiveCoding
+                        };
+                        if transcript_command_sender
+                            .send(TranscriptCommand::SetMode(active_mode))
+                            .is_err()
+                        {
+                            break StopReason::Transcript;
+                        }
+                        if candidate_enabled
+                            && candidate_command_sender
+                                .send(TranscriptCommand::SetMode(active_mode))
+                                .is_err()
+                        {
+                            break StopReason::CandidateTranscript;
+                        }
+                        if output_sender
+                            .send(OutputEvent::ModeChanged { mode: active_mode })
+                            .is_err()
+                        {
+                            break StopReason::Output;
+                        }
+                        info!(
+                            module = "app",
+                            event = "mode_changed",
+                            mode = %active_mode,
+                            "pipeline mode changed"
+                        );
                     }
                     Some(AppCommand::ClearHistory) => {
                         if llm_command_sender.send(LlmCommand::ClearHistory).is_err() {
@@ -293,6 +405,18 @@ where
                 transcript_completed = Some(result);
                 break StopReason::Transcript;
             }
+            result = wait_optional_task(&mut candidate_audio_task) => {
+                candidate_audio_completed = Some(result);
+                break StopReason::CandidateAudio;
+            }
+            result = wait_optional_task(&mut candidate_stt_task) => {
+                candidate_stt_completed = Some(result);
+                break StopReason::CandidateStt;
+            }
+            result = wait_optional_task(&mut candidate_transcript_task) => {
+                candidate_transcript_completed = Some(result);
+                break StopReason::CandidateTranscript;
+            }
             result = &mut llm_task => {
                 llm_completed = Some(result);
                 break StopReason::Llm;
@@ -312,6 +436,7 @@ where
         );
     }
     drop(frame_sender_guard);
+    drop(candidate_frame_sender_guard);
 
     let shutdown_timeout = if benchmark_mode {
         BENCHMARK_SHUTDOWN_TIMEOUT
@@ -325,6 +450,27 @@ where
         "transcript",
         &mut transcript_task,
         transcript_completed,
+        shutdown_timeout,
+    )
+    .await?;
+    let candidate_audio_result = finish_optional_task(
+        "candidate audio",
+        &mut candidate_audio_task,
+        candidate_audio_completed,
+        shutdown_timeout,
+    )
+    .await?;
+    let candidate_stt_result = finish_optional_task(
+        "candidate STT",
+        &mut candidate_stt_task,
+        candidate_stt_completed,
+        shutdown_timeout,
+    )
+    .await?;
+    let candidate_transcript_stats = finish_optional_task(
+        "candidate transcript",
+        &mut candidate_transcript_task,
+        candidate_transcript_completed,
         shutdown_timeout,
     )
     .await?;
@@ -354,7 +500,17 @@ where
 
     flatten_audio_task(audio_result)?;
     flatten_stt_task(stt_result)?;
+    if let Some(result) = candidate_audio_result {
+        flatten_audio_task(result)?;
+    }
+    if let Some(result) = candidate_stt_result {
+        flatten_stt_task(result)?;
+    }
     let transcript_stats = transcript_stats.map_err(AppError::TranscriptWorker)?;
+    let candidate_transcript_stats = candidate_transcript_stats
+        .transpose()
+        .map_err(AppError::TranscriptWorker)?
+        .unwrap_or_default();
     let llm_stats = llm_stats.map_err(AppError::LlmWorker)?;
     let output_stats = output_stats.map_err(|error| AppError::Output(error.to_string()))?;
 
@@ -365,9 +521,9 @@ where
     info!(
         module = "app",
         event = "shutdown_completed",
-        transcript_events = transcript_stats.transcripts,
-        final_transcripts = transcript_stats.final_transcripts,
-        transcript_chunks = transcript_stats.chunks,
+        transcript_events = transcript_stats.transcripts + candidate_transcript_stats.transcripts,
+        final_transcripts = transcript_stats.final_transcripts + candidate_transcript_stats.final_transcripts,
+        transcript_chunks = transcript_stats.chunks + candidate_transcript_stats.chunks,
         knowledge_searches = knowledge_stats.searches,
         knowledge_failed = knowledge_stats.failed,
         knowledge_coalesced = knowledge_stats.coalesced,
@@ -388,6 +544,9 @@ enum StopReason {
     Audio,
     Stt,
     Transcript,
+    CandidateAudio,
+    CandidateStt,
+    CandidateTranscript,
     Llm,
     Output,
 }
@@ -399,6 +558,9 @@ impl StopReason {
             Self::Audio => Some("audio"),
             Self::Stt => Some("stt"),
             Self::Transcript => Some("transcript"),
+            Self::CandidateAudio => Some("candidate audio"),
+            Self::CandidateStt => Some("candidate STT"),
+            Self::CandidateTranscript => Some("candidate transcript"),
             Self::Llm => Some("LLM"),
             Self::Output => Some("output"),
         }
@@ -808,6 +970,7 @@ impl BoundaryDeferral {
 #[derive(Clone, Copy)]
 enum TranscriptCommand {
     SetPaused(bool),
+    SetMode(Mode),
 }
 
 #[cfg(test)]
@@ -826,6 +989,7 @@ async fn run_transcript_windows(
         commands,
         config,
         readiness,
+        Speaker::Interviewer,
         None,
     )
     .await
@@ -838,6 +1002,7 @@ async fn run_transcript_windows_with_retrieval(
     mut commands: mpsc::UnboundedReceiver<TranscriptCommand>,
     config: TranscriptConfig,
     readiness: Option<watch::Receiver<bool>>,
+    speaker: Speaker,
     mut retrieval: Option<RetrievalPipeline>,
 ) -> Result<TranscriptStats, TranscriptWorkerError> {
     if let Some(readiness) = readiness {
@@ -855,6 +1020,7 @@ async fn run_transcript_windows_with_retrieval(
     let mut pending_last_word_end_ms = None;
     let mut interim_fallback_deferred = false;
     let mut paused = false;
+    let mut mode = Mode::Voice;
     let mut commands_open = true;
 
     loop {
@@ -872,8 +1038,19 @@ async fn run_transcript_windows_with_retrieval(
                             if let Some(retrieval) = retrieval.as_mut() {
                                 retrieval.reset();
                             }
-                            send_transcript_draft(&assembler, &output)?;
+                            send_transcript_draft(&assembler, &output, speaker)?;
                         }
+                    }
+                    Some(TranscriptCommand::SetMode(next_mode)) => {
+                        mode = next_mode;
+                        assembler.discard_pending();
+                        pending_last_word_end_ms = None;
+                        interim_fallback_deferred = false;
+                        fallback_armed = false;
+                        if let Some(retrieval) = retrieval.as_mut() {
+                            retrieval.reset();
+                        }
+                        send_transcript_draft(&assembler, &output, speaker)?;
                     }
                     None => commands_open = false,
                 }
@@ -896,6 +1073,8 @@ async fn run_transcript_windows_with_retrieval(
                         &output,
                         &mut stats,
                         "inactivity_timeout",
+                        mode,
+                        speaker,
                         &mut retrieval,
                     )
                     .await?;
@@ -925,6 +1104,7 @@ async fn run_transcript_windows_with_retrieval(
                             &mut pending_last_word_end_ms,
                             &output,
                             &mut stats,
+                            speaker,
                         )?;
 
                     if has_transcript {
@@ -933,7 +1113,10 @@ async fn run_transcript_windows_with_retrieval(
                             .reset(Instant::now() + fallback_duration);
                         interim_fallback_deferred = false;
                         fallback_armed = true;
-                        if let Some(retrieval) = retrieval.as_mut() {
+                        if mode == Mode::Voice
+                            && speaker == Speaker::Interviewer
+                            && let Some(retrieval) = retrieval.as_mut()
+                        {
                             retrieval.prefetch(&assembler.preview(), force_retrieval);
                         }
                     }
@@ -944,6 +1127,8 @@ async fn run_transcript_windows_with_retrieval(
                             &output,
                             &mut stats,
                             reason,
+                            mode,
+                            speaker,
                             &mut retrieval,
                         )
                         .await?;
@@ -962,6 +1147,8 @@ async fn run_transcript_windows_with_retrieval(
         &llm_requests,
         &output,
         &mut stats,
+        mode,
+        speaker,
         &mut retrieval,
     )
     .await?;
@@ -974,14 +1161,18 @@ fn handle_deepgram_event(
     pending_last_word_end_ms: &mut Option<u64>,
     output: &mpsc::UnboundedSender<OutputEvent>,
     stats: &mut TranscriptStats,
+    speaker: Speaker,
 ) -> Result<Option<&'static str>, TranscriptWorkerError> {
     let mut flush_reason = None;
     match event {
-        DeepgramEvent::Status(status) => handle_stt_status(status, output)?,
+        DeepgramEvent::Status(status) => handle_stt_status(status, output, speaker)?,
         DeepgramEvent::AudioStreamStarted => {
             send_output(
                 output,
-                OutputEvent::SttObservation(SttObservation::AudioStreamStarted),
+                OutputEvent::SttObservation {
+                    speaker,
+                    observation: SttObservation::AudioStreamStarted,
+                },
             )?;
         }
         DeepgramEvent::Transcript {
@@ -1000,15 +1191,18 @@ fn handle_deepgram_event(
             let speech_final_deferred = boundary_deferral.is_some();
             send_output(
                 output,
-                OutputEvent::SttObservation(SttObservation::Transcript {
-                    text: text.clone(),
-                    is_final,
-                    speech_final,
-                    speech_final_deferred,
-                    audio_start_ms,
-                    audio_duration_ms,
-                    last_word_end_ms,
-                }),
+                OutputEvent::SttObservation {
+                    speaker,
+                    observation: SttObservation::Transcript {
+                        text: text.clone(),
+                        is_final,
+                        speech_final,
+                        speech_final_deferred,
+                        audio_start_ms,
+                        audio_duration_ms,
+                        last_word_end_ms,
+                    },
+                },
             )?;
             if is_final {
                 stats.final_transcripts += 1;
@@ -1030,7 +1224,7 @@ fn handle_deepgram_event(
             if let Some(last_word_end_ms) = last_word_end_ms {
                 *pending_last_word_end_ms = Some(last_word_end_ms);
             }
-            send_transcript_draft(assembler, output)?;
+            send_transcript_draft(assembler, output, speaker)?;
             if is_final && speech_final {
                 if let Some(deferral) = boundary_deferral {
                     debug!(
@@ -1048,7 +1242,10 @@ fn handle_deepgram_event(
         DeepgramEvent::SpeechStarted { audio_timestamp_ms } => {
             send_output(
                 output,
-                OutputEvent::SttObservation(SttObservation::SpeechStarted { audio_timestamp_ms }),
+                OutputEvent::SttObservation {
+                    speaker,
+                    observation: SttObservation::SpeechStarted { audio_timestamp_ms },
+                },
             )?;
             debug!(
                 module = "stt",
@@ -1066,11 +1263,14 @@ fn handle_deepgram_event(
             let deferred = boundary_deferral.is_some();
             send_output(
                 output,
-                OutputEvent::SttObservation(SttObservation::UtteranceEnd {
-                    last_word_end_ms,
-                    ignored,
-                    deferred,
-                }),
+                OutputEvent::SttObservation {
+                    speaker,
+                    observation: SttObservation::UtteranceEnd {
+                        last_word_end_ms,
+                        ignored,
+                        deferred,
+                    },
+                },
             )?;
             if ignored {
                 debug!(
@@ -1105,6 +1305,7 @@ fn handle_deepgram_event(
             warn!(
                 module = "stt",
                 event = "error",
+                speaker = %speaker,
                 error = %error,
                 "Deepgram error"
             );
@@ -1112,7 +1313,7 @@ fn handle_deepgram_event(
                 output,
                 OutputEvent::Error(AppErrorView {
                     component: OutputComponent::Stt,
-                    message: error,
+                    message: format!("{speaker}: {error}"),
                 }),
             )?;
         }
@@ -1207,6 +1408,7 @@ fn has_question_signal(words: &[String]) -> bool {
 fn handle_stt_status(
     status: SttStatus,
     output: &mpsc::UnboundedSender<OutputEvent>,
+    speaker: Speaker,
 ) -> Result<(), TranscriptWorkerError> {
     let (kind, text, queue_len) = match status {
         SttStatus::Connecting {
@@ -1215,15 +1417,18 @@ fn handle_stt_status(
         } => (
             StatusKind::Connecting,
             if retry_count == 0 {
-                "connecting to Deepgram".to_owned()
+                format!("connecting {speaker} speech to Deepgram")
             } else {
-                format!("connecting to Deepgram (attempt {})", retry_count + 1)
+                format!(
+                    "connecting {speaker} speech to Deepgram (attempt {})",
+                    retry_count + 1
+                )
             },
             queue_len,
         ),
         SttStatus::Connected { queue_len } => (
             StatusKind::Listening,
-            "Deepgram connected; listening".to_owned(),
+            format!("Deepgram connected; listening to {speaker}"),
             queue_len,
         ),
         SttStatus::Reconnecting {
@@ -1232,7 +1437,9 @@ fn handle_stt_status(
             queue_len,
         } => (
             StatusKind::Reconnecting,
-            format!("Deepgram reconnect in {delay_secs}s (retry {retry_count})"),
+            format!(
+                "Deepgram {speaker} reconnect in {delay_secs}s (retry {retry_count})"
+            ),
             queue_len,
         ),
     };
@@ -1253,6 +1460,8 @@ async fn flush_transcript_utterance(
     output: &mpsc::UnboundedSender<OutputEvent>,
     stats: &mut TranscriptStats,
     reason: &'static str,
+    mode: Mode,
+    speaker: Speaker,
     retrieval: &mut Option<RetrievalPipeline>,
 ) -> Result<(), TranscriptWorkerError> {
     queue_transcript_chunk(
@@ -1261,19 +1470,23 @@ async fn flush_transcript_utterance(
         output,
         stats,
         reason,
+        mode,
+        speaker,
         retrieval,
     )
     .await?;
-    send_transcript_draft(assembler, output)
+    send_transcript_draft(assembler, output, speaker)
 }
 
 fn send_transcript_draft(
     assembler: &TranscriptWindowAssembler,
     output: &mpsc::UnboundedSender<OutputEvent>,
+    speaker: Speaker,
 ) -> Result<(), TranscriptWorkerError> {
     send_output(
         output,
         OutputEvent::TranscriptDraft {
+            speaker,
             text: assembler.preview(),
         },
     )
@@ -1284,6 +1497,8 @@ async fn finish_transcript_window(
     llm_requests: &LlmRequestSender,
     output: &mpsc::UnboundedSender<OutputEvent>,
     stats: &mut TranscriptStats,
+    mode: Mode,
+    speaker: Speaker,
     retrieval: &mut Option<RetrievalPipeline>,
 ) -> Result<(), TranscriptWorkerError> {
     queue_transcript_chunk(
@@ -1292,6 +1507,8 @@ async fn finish_transcript_window(
         output,
         stats,
         "shutdown",
+        mode,
+        speaker,
         retrieval,
     )
     .await
@@ -1303,17 +1520,24 @@ async fn queue_transcript_chunk(
     output: &mpsc::UnboundedSender<OutputEvent>,
     stats: &mut TranscriptStats,
     reason: &'static str,
+    mode: Mode,
+    speaker: Speaker,
     retrieval: &mut Option<RetrievalPipeline>,
 ) -> Result<(), TranscriptWorkerError> {
     let Some(chunk) = chunk else {
         return Ok(());
     };
 
-    let request_id = chunk.sequence;
+    let request_id = if speaker == Speaker::Candidate {
+        CANDIDATE_REQUEST_ID_BIT | chunk.sequence
+    } else {
+        chunk.sequence
+    };
     info!(
         module = "transcript",
         event = "utterance_flushed",
         sequence = request_id,
+        speaker = %speaker,
         reason,
         text = %chunk.text,
         "TRANSCRIPT UTTERANCE"
@@ -1322,11 +1546,16 @@ async fn queue_transcript_chunk(
         output,
         OutputEvent::Transcript(TranscriptView {
             sequence: request_id,
+            mode,
+            speaker,
             text: chunk.text.clone(),
             flush_reason: reason.to_owned(),
         }),
     )?;
-    let knowledge = if let Some(retrieval) = retrieval.as_mut() {
+    let knowledge = if mode == Mode::Voice
+        && speaker == Speaker::Interviewer
+        && let Some(retrieval) = retrieval.as_mut()
+    {
         match retrieval.resolve(&chunk.text).await {
             Ok(context) => {
                 info!(
@@ -1376,7 +1605,8 @@ async fn queue_transcript_chunk(
     llm_requests
         .send(LlmRequest {
             request_id,
-            mode: Mode::Voice,
+            mode,
+            speaker,
             text: chunk.text,
             knowledge,
         })
@@ -1523,6 +1753,27 @@ async fn finish_task<T>(
     })
 }
 
+async fn wait_optional_task<T>(task: &mut Option<JoinHandle<T>>) -> Result<T, JoinError> {
+    match task {
+        Some(task) => task.await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn finish_optional_task<T>(
+    name: &'static str,
+    task: &mut Option<JoinHandle<T>>,
+    completed: Option<Result<T, JoinError>>,
+    shutdown_timeout: Duration,
+) -> Result<Option<T>, AppError> {
+    let Some(task) = task.as_mut() else {
+        return Ok(None);
+    };
+    finish_task(name, task, completed, shutdown_timeout)
+        .await
+        .map(Some)
+}
+
 fn flatten_audio_task(result: Result<(), AudioError>) -> Result<(), AppError> {
     result.map_err(AppError::Audio)
 }
@@ -1577,26 +1828,31 @@ mod tests {
         assert_eq!(request.text, "Что такое HashMap?");
         assert!(matches!(
             output_receiver.recv().await,
-            Some(OutputEvent::SttObservation(SttObservation::Transcript {
-                text,
-                is_final: true,
-                speech_final: true,
-                speech_final_deferred: false,
-                audio_start_ms: Some(100),
-                audio_duration_ms: Some(900),
-                last_word_end_ms: Some(900),
-            })) if text == "Что такое HashMap?"
+            Some(OutputEvent::SttObservation {
+                speaker: Speaker::Interviewer,
+                observation: SttObservation::Transcript {
+                    text,
+                    is_final: true,
+                    speech_final: true,
+                    speech_final_deferred: false,
+                    audio_start_ms: Some(100),
+                    audio_duration_ms: Some(900),
+                    last_word_end_ms: Some(900),
+                },
+            }) if text == "Что такое HashMap?"
         ));
         assert!(matches!(
             output_receiver.recv().await,
-            Some(OutputEvent::TranscriptDraft { text }) if text == "Что такое HashMap?"
+            Some(OutputEvent::TranscriptDraft { text, .. }) if text == "Что такое HashMap?"
         ));
         assert!(matches!(
             output_receiver.recv().await,
             Some(OutputEvent::Transcript(TranscriptView {
                 sequence: 0,
+                mode: Mode::Voice,
                 text,
                 flush_reason,
+                ..
             })) if text == "Что такое HashMap?" && flush_reason == "speech_final"
         ));
     }
@@ -1665,11 +1921,18 @@ mod tests {
         let mut flush_reason = None;
         while let Ok(event) = output_receiver.try_recv() {
             match event {
-                OutputEvent::SttObservation(SttObservation::Transcript {
-                    speech_final_deferred,
+                OutputEvent::SttObservation {
+                    observation:
+                        SttObservation::Transcript {
+                            speech_final_deferred,
+                            ..
+                        },
                     ..
-                }) => deferred |= speech_final_deferred,
-                OutputEvent::SttObservation(SttObservation::UtteranceEnd { deferred, .. }) => {
+                } => deferred |= speech_final_deferred,
+                OutputEvent::SttObservation {
+                    observation: SttObservation::UtteranceEnd { deferred, .. },
+                    ..
+                } => {
                     utterance_end_deferred |= deferred
                 }
                 OutputEvent::Transcript(transcript) => {
@@ -1968,11 +2231,14 @@ mod tests {
         while let Ok(event) = output_receiver.try_recv() {
             ignored_stale_boundary |= matches!(
                 event,
-                OutputEvent::SttObservation(SttObservation::UtteranceEnd {
-                    last_word_end_ms: Some(3_100),
-                    ignored: true,
-                    deferred: false,
-                })
+                OutputEvent::SttObservation {
+                    observation: SttObservation::UtteranceEnd {
+                        last_word_end_ms: Some(3_100),
+                        ignored: true,
+                        deferred: false,
+                    },
+                    ..
+                }
             );
         }
         assert!(ignored_stale_boundary);
@@ -1998,6 +2264,7 @@ mod tests {
             &mut pending_last_word_end_ms,
             &output_sender,
             &mut stats,
+            Speaker::Interviewer,
         )
         .expect("interim transcript must be forwarded");
         handle_deepgram_event(
@@ -2013,42 +2280,51 @@ mod tests {
             &mut pending_last_word_end_ms,
             &output_sender,
             &mut stats,
+            Speaker::Interviewer,
         )
         .expect("growing interim transcript must be forwarded");
 
         assert_eq!(
             output_receiver.try_recv(),
-            Ok(OutputEvent::SttObservation(SttObservation::Transcript {
-                text: "что такое".to_owned(),
-                is_final: false,
-                speech_final: false,
-                speech_final_deferred: false,
-                audio_start_ms: None,
-                audio_duration_ms: None,
-                last_word_end_ms: None,
-            }))
+            Ok(OutputEvent::SttObservation {
+                speaker: Speaker::Interviewer,
+                observation: SttObservation::Transcript {
+                    text: "что такое".to_owned(),
+                    is_final: false,
+                    speech_final: false,
+                    speech_final_deferred: false,
+                    audio_start_ms: None,
+                    audio_duration_ms: None,
+                    last_word_end_ms: None,
+                },
+            })
         );
         assert_eq!(
             output_receiver.try_recv(),
             Ok(OutputEvent::TranscriptDraft {
+                speaker: Speaker::Interviewer,
                 text: "что такое".to_owned(),
             })
         );
         assert_eq!(
             output_receiver.try_recv(),
-            Ok(OutputEvent::SttObservation(SttObservation::Transcript {
-                text: "что такое HashMap".to_owned(),
-                is_final: false,
-                speech_final: false,
-                speech_final_deferred: false,
-                audio_start_ms: None,
-                audio_duration_ms: None,
-                last_word_end_ms: None,
-            }))
+            Ok(OutputEvent::SttObservation {
+                speaker: Speaker::Interviewer,
+                observation: SttObservation::Transcript {
+                    text: "что такое HashMap".to_owned(),
+                    is_final: false,
+                    speech_final: false,
+                    speech_final_deferred: false,
+                    audio_start_ms: None,
+                    audio_duration_ms: None,
+                    last_word_end_ms: None,
+                },
+            })
         );
         assert_eq!(
             output_receiver.try_recv(),
             Ok(OutputEvent::TranscriptDraft {
+                speaker: Speaker::Interviewer,
                 text: "что такое HashMap".to_owned(),
             })
         );
@@ -2115,6 +2391,7 @@ mod tests {
                 queue_len: 17,
             },
             &output_sender,
+            Speaker::Interviewer,
         )
         .expect("status must be forwarded");
 

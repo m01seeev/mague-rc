@@ -18,7 +18,7 @@ use crate::{
     output::{OutputSink, OutputStats},
 };
 
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 9;
 
 #[derive(Debug, Error)]
 pub enum TelemetryError {
@@ -56,6 +56,18 @@ impl<S> TelemetryOutputSink<S> {
             inner,
             recorder: TelemetryRecorder::new(directory, label, audio_path, reference_path, config)?,
         })
+    }
+
+    pub fn new_session(
+        inner: S,
+        directory: impl AsRef<Path>,
+        label: &str,
+        config: &Config,
+    ) -> Result<Self, TelemetryError> {
+        let recorder = TelemetryRecorder::new_session(directory, label, config)?;
+        eprintln!("session events: {}", recorder.events_path.display());
+        eprintln!("session summary: {}", recorder.summary_path.display());
+        Ok(Self { inner, recorder })
     }
 }
 
@@ -103,6 +115,7 @@ struct TelemetryRecorder {
     event_count: u64,
     requests: BTreeMap<u64, RequestMetrics>,
     utterances: Vec<UtteranceMetrics>,
+    live_coding: Vec<LiveCodingRevision>,
     active_utterance: Option<usize>,
     active_request: Option<u64>,
     audio_stream_started_ms: Option<u64>,
@@ -125,6 +138,32 @@ impl TelemetryRecorder {
         reference_path: Option<&Path>,
         config: &Config,
     ) -> Result<Self, TelemetryError> {
+        Self::create(
+            directory,
+            label,
+            "benchmark",
+            Some(audio_path.as_ref()),
+            reference_path,
+            config,
+        )
+    }
+
+    fn new_session(
+        directory: impl AsRef<Path>,
+        label: &str,
+        config: &Config,
+    ) -> Result<Self, TelemetryError> {
+        Self::create(directory, label, "overlay", None, None, config)
+    }
+
+    fn create(
+        directory: impl AsRef<Path>,
+        label: &str,
+        run_kind: &str,
+        audio_path: Option<&Path>,
+        reference_path: Option<&Path>,
+        config: &Config,
+    ) -> Result<Self, TelemetryError> {
         let directory = directory.as_ref();
         fs::create_dir_all(directory)?;
         let started_unix_ms = unix_time_ms();
@@ -133,27 +172,30 @@ impl TelemetryRecorder {
         let events_path = directory.join(format!("{file_stem}.events.jsonl"));
         let summary_path = directory.join(format!("{file_stem}.summary.json"));
         let writer = BufWriter::new(File::create(&events_path)?);
-        let audio_path = audio_path.as_ref();
-        let audio_bytes = fs::metadata(audio_path).map(|metadata| metadata.len()).ok();
+        let audio_bytes = audio_path
+            .and_then(|path| fs::metadata(path).map(|metadata| metadata.len()).ok());
         let reference_text = reference_path.map(fs::read_to_string).transpose()?;
 
         let metadata = RunMetadata {
             schema_version: SCHEMA_VERSION,
             run_id,
             label: label.to_owned(),
+            run_kind: run_kind.to_owned(),
             started_unix_ms,
             application_version: env!("CARGO_PKG_VERSION").to_owned(),
             git_branch: git_output(&["branch", "--show-current"]),
             git_commit: git_output(&["rev-parse", "HEAD"]),
             git_dirty: git_output(&["status", "--porcelain"])
                 .is_some_and(|output| !output.is_empty()),
-            audio_file: fs::canonicalize(audio_path)
-                .unwrap_or_else(|_| audio_path.to_path_buf())
-                .display()
-                .to_string(),
+            audio_file: audio_path.map(|path| {
+                fs::canonicalize(path)
+                    .unwrap_or_else(|_| path.to_path_buf())
+                    .display()
+                    .to_string()
+            }),
             audio_bytes,
-            audio_sha256: file_sha256(audio_path),
-            audio_duration_ms: audio_duration_ms(audio_path),
+            audio_sha256: audio_path.and_then(file_sha256),
+            audio_duration_ms: audio_path.and_then(audio_duration_ms),
             reference_file: reference_path.map(|path| {
                 fs::canonicalize(path)
                     .unwrap_or_else(|_| path.to_path_buf())
@@ -176,6 +218,7 @@ impl TelemetryRecorder {
             event_count: 0,
             requests: BTreeMap::new(),
             utterances: Vec::new(),
+            live_coding: Vec::new(),
             active_utterance: None,
             active_request: None,
             audio_stream_started_ms: None,
@@ -197,44 +240,62 @@ impl TelemetryRecorder {
     fn record(&mut self, event: &OutputEvent) -> Result<(), TelemetryError> {
         let elapsed_ms = self.elapsed_ms();
         let (name, request_id, fields) = match event {
+            OutputEvent::ModeChanged { mode } => {
+                ("mode_changed", None, json!({"mode": mode.to_string()}))
+            }
             OutputEvent::Status(status) => (
                 "status",
                 None,
                 json!({"kind": format!("{:?}", status.kind), "text": status.text}),
             ),
-            OutputEvent::SttObservation(observation) => {
-                return self.record_stt(elapsed_ms, observation);
+            OutputEvent::SttObservation {
+                speaker,
+                observation,
+            } => {
+                return self.record_stt(elapsed_ms, *speaker, observation);
             }
-            OutputEvent::TranscriptDraft { text } => {
-                if text.is_empty() {
-                    self.draft_active = false;
-                } else if !self.draft_active {
-                    self.draft_active = true;
-                    self.draft_started_ms = Some(elapsed_ms);
+            OutputEvent::TranscriptDraft { speaker, text } => {
+                if *speaker == crate::events::Speaker::Interviewer {
+                    if text.is_empty() {
+                        self.draft_active = false;
+                    } else if !self.draft_active {
+                        self.draft_active = true;
+                        self.draft_started_ms = Some(elapsed_ms);
+                    }
                 }
                 (
                     "transcript_draft",
                     None,
-                    json!({"text": text, "chars": text.chars().count()}),
+                    json!({
+                        "speaker": speaker.to_string(),
+                        "text": text,
+                        "chars": text.chars().count(),
+                    }),
                 )
             }
             OutputEvent::Transcript(transcript) => {
                 let metrics = self.requests.entry(transcript.sequence).or_default();
+                metrics.mode = transcript.mode.to_string();
+                metrics.speaker = transcript.speaker.to_string();
                 metrics.question.clone_from(&transcript.text);
                 metrics.flush_reason.clone_from(&transcript.flush_reason);
-                metrics.draft_started_ms = self.draft_started_ms.take();
                 metrics.question_ready_ms = Some(elapsed_ms);
-                metrics.last_final_ms = self.last_final_ms.take();
-                metrics.speech_final_ms = self.last_speech_final_ms.take();
-                metrics.utterance_end_ms = self.last_utterance_end_ms.take();
-                metrics.last_word_end_audio_ms = self.last_word_end_audio_ms.take();
-                metrics.last_word_to_boundary_ms = self.last_word_to_boundary_ms.take();
-                self.draft_active = false;
+                if transcript.speaker == crate::events::Speaker::Interviewer {
+                    metrics.draft_started_ms = self.draft_started_ms.take();
+                    metrics.last_final_ms = self.last_final_ms.take();
+                    metrics.speech_final_ms = self.last_speech_final_ms.take();
+                    metrics.utterance_end_ms = self.last_utterance_end_ms.take();
+                    metrics.last_word_end_audio_ms = self.last_word_end_audio_ms.take();
+                    metrics.last_word_to_boundary_ms = self.last_word_to_boundary_ms.take();
+                    self.draft_active = false;
+                }
                 (
                     "question_ready",
                     Some(transcript.sequence),
                     json!({
                         "text": transcript.text,
+                        "mode": transcript.mode.to_string(),
+                        "speaker": transcript.speaker.to_string(),
                         "chars": transcript.text.chars().count(),
                         "words": word_count(&transcript.text),
                         "flush_reason": transcript.flush_reason,
@@ -264,8 +325,10 @@ impl TelemetryRecorder {
                         .snippets
                         .iter()
                         .map(|snippet| RetrievalHitMetrics {
+                            id: snippet.id.clone(),
                             source: snippet.source.clone(),
                             heading: snippet.heading.clone(),
+                            text: snippet.text.clone(),
                             score: snippet.score,
                         })
                         .collect(),
@@ -293,6 +356,7 @@ impl TelemetryRecorder {
                             "heading": snippet.heading,
                             "score": snippet.score,
                             "chars": snippet.text.chars().count(),
+                            "text": snippet.text,
                         })).collect::<Vec<_>>(),
                     }),
                 )
@@ -310,7 +374,10 @@ impl TelemetryRecorder {
                 (
                     "llm_started",
                     Some(meta.request_id),
-                    json!({"mode": meta.mode.to_string()}),
+                    json!({
+                        "mode": meta.mode.to_string(),
+                        "speaker": meta.speaker.to_string(),
+                    }),
                 )
             }
             OutputEvent::AnswerDelta { request_id, text } => {
@@ -342,6 +409,40 @@ impl TelemetryRecorder {
                 self.requests.entry(*request_id).or_default().completed_ms = Some(elapsed_ms);
                 ("answer_completed", Some(*request_id), json!({}))
             }
+            OutputEvent::LiveCodingUpdated(state) => {
+                let request_id = self.active_request;
+                let speaker = request_id
+                    .and_then(|request_id| self.requests.get(&request_id))
+                    .map(|metrics| metrics.speaker.clone())
+                    .filter(|speaker| !speaker.is_empty());
+                self.live_coding.push(LiveCodingRevision {
+                    request_id,
+                    speaker: speaker.clone(),
+                    revision: state.revision,
+                    summary: state.summary.clone(),
+                    candidate_context: state.candidate_context.clone(),
+                    explanation: state.explanation.clone(),
+                    language: state.language.clone(),
+                    code: state.code.clone(),
+                    change_note: state.change_note.clone(),
+                    changed_lines: state.changed_lines.clone(),
+                });
+                (
+                    "live_coding_updated",
+                    request_id,
+                    json!({
+                        "revision": state.revision,
+                        "speaker": speaker,
+                        "summary": state.summary,
+                        "candidate_context": state.candidate_context,
+                        "explanation": state.explanation,
+                        "language": state.language,
+                        "code": state.code,
+                        "change_note": state.change_note,
+                        "changed_lines": state.changed_lines,
+                    }),
+                )
+            }
             OutputEvent::QueueState(queue) => (
                 "queue_state",
                 None,
@@ -372,8 +473,12 @@ impl TelemetryRecorder {
     fn record_stt(
         &mut self,
         elapsed_ms: u64,
+        speaker: crate::events::Speaker,
         observation: &SttObservation,
     ) -> Result<(), TelemetryError> {
+        if speaker == crate::events::Speaker::Candidate {
+            return self.record_candidate_stt(elapsed_ms, observation);
+        }
         let (name, fields) = match observation {
             SttObservation::AudioStreamStarted => {
                 self.audio_stream_started_ms = Some(elapsed_ms);
@@ -539,6 +644,73 @@ impl TelemetryRecorder {
                 )
             }
         };
+        let mut fields = fields;
+        if let Value::Object(values) = &mut fields {
+            values.insert("speaker".to_owned(), json!(speaker.to_string()));
+        }
+        self.write_event(elapsed_ms, name, None, fields)
+    }
+
+    fn record_candidate_stt(
+        &mut self,
+        elapsed_ms: u64,
+        observation: &SttObservation,
+    ) -> Result<(), TelemetryError> {
+        let (name, fields) = match observation {
+            SttObservation::AudioStreamStarted => ("audio_stream_started", json!({})),
+            SttObservation::Transcript {
+                text,
+                is_final,
+                speech_final,
+                speech_final_deferred,
+                audio_start_ms,
+                audio_duration_ms,
+                last_word_end_ms,
+            } => {
+                let audio_end_ms = (*audio_start_ms)
+                    .zip(*audio_duration_ms)
+                    .and_then(|(start, duration)| start.checked_add(duration));
+                (
+                    "stt_transcript",
+                    json!({
+                        "text": text,
+                        "chars": text.chars().count(),
+                        "is_final": is_final,
+                        "speech_final": speech_final,
+                        "speech_final_deferred": speech_final_deferred,
+                        "audio_start_ms": audio_start_ms,
+                        "audio_duration_ms": audio_duration_ms,
+                        "audio_end_ms": audio_end_ms,
+                        "last_word_end_ms": last_word_end_ms,
+                        "delivery_lag_ms": null,
+                    }),
+                )
+            }
+            SttObservation::SpeechStarted { audio_timestamp_ms } => (
+                "speech_started",
+                json!({
+                    "audio_timestamp_ms": audio_timestamp_ms,
+                    "delivery_lag_ms": null,
+                }),
+            ),
+            SttObservation::UtteranceEnd {
+                last_word_end_ms,
+                ignored,
+                deferred,
+            } => (
+                "utterance_end",
+                json!({
+                    "last_word_end_ms": last_word_end_ms,
+                    "delivery_lag_ms": null,
+                    "ignored": ignored,
+                    "deferred": deferred,
+                }),
+            ),
+        };
+        let mut fields = fields;
+        if let Value::Object(values) = &mut fields {
+            values.insert("speaker".to_owned(), json!("candidate"));
+        }
         self.write_event(elapsed_ms, name, None, fields)
     }
 
@@ -579,6 +751,7 @@ impl TelemetryRecorder {
             }),
         )?;
         self.writer.write_all(b"\n")?;
+        self.writer.flush()?;
         Ok(())
     }
 
@@ -616,11 +789,14 @@ impl TelemetryRecorder {
             aggregates: AggregateSummary::new(&requests),
             requests,
             utterances,
+            live_coding: self.live_coding,
             recognition_segments: self.recognition_segments,
             accuracy,
         };
         let summary_file = File::create(&self.summary_path)?;
-        serde_json::to_writer_pretty(BufWriter::new(summary_file), &summary)?;
+        let mut summary_writer = BufWriter::new(summary_file);
+        serde_json::to_writer_pretty(&mut summary_writer, &summary)?;
+        summary_writer.flush()?;
 
         Ok(TelemetryArtifacts {
             events_path: self.events_path,
@@ -654,6 +830,7 @@ struct RunSummary {
     aggregates: AggregateSummary,
     requests: Vec<RequestSummary>,
     utterances: Vec<UtteranceSummary>,
+    live_coding: Vec<LiveCodingRevision>,
     recognition_segments: Vec<String>,
     accuracy: Option<AccuracySummary>,
 }
@@ -663,18 +840,33 @@ struct RunMetadata {
     schema_version: u32,
     run_id: String,
     label: String,
+    run_kind: String,
     started_unix_ms: u64,
     application_version: String,
     git_branch: Option<String>,
     git_commit: Option<String>,
     git_dirty: bool,
-    audio_file: String,
+    audio_file: Option<String>,
     audio_bytes: Option<u64>,
     audio_sha256: Option<String>,
     audio_duration_ms: Option<u64>,
     reference_file: Option<String>,
     reference_sha256: Option<String>,
     configuration: ConfigurationSnapshot,
+}
+
+#[derive(Serialize)]
+struct LiveCodingRevision {
+    request_id: Option<u64>,
+    speaker: Option<String>,
+    revision: u64,
+    summary: String,
+    candidate_context: String,
+    explanation: String,
+    language: String,
+    code: String,
+    change_note: String,
+    changed_lines: Vec<usize>,
 }
 
 #[derive(Serialize)]
@@ -691,13 +883,20 @@ struct ConfigurationSnapshot {
     utterance_end_ms: u64,
     keyterms: Vec<String>,
     audio_chunk_ms: u64,
+    candidate_mic_enabled: bool,
+    candidate_mic_source: String,
     transcript_segmentation: &'static str,
     transcript_window_sec: u64,
     min_utterance_chars: usize,
     llm_model: String,
     max_history_pairs: usize,
+    separate_histories: bool,
     temperature: f32,
     max_tokens: u32,
+    timeout_sec: u64,
+    coding_temperature: f32,
+    coding_max_tokens: u32,
+    coding_timeout_sec: u64,
     rag_enabled: bool,
     rag_embedding_provider: &'static str,
     rag_embedding_model: String,
@@ -727,13 +926,20 @@ impl From<&Config> for ConfigurationSnapshot {
             utterance_end_ms: config.deepgram.utterance_end_ms,
             keyterms: config.deepgram.keyterms.clone(),
             audio_chunk_ms: config.audio.chunk_ms,
+            candidate_mic_enabled: config.candidate_audio.enabled,
+            candidate_mic_source: config.candidate_audio.source.clone(),
             transcript_segmentation: "deepgram_utterance_with_inactivity_fallback",
             transcript_window_sec: config.transcript.window_sec,
             min_utterance_chars: config.transcript.min_utterance_chars,
             llm_model: config.llm.model.clone(),
             max_history_pairs: config.llm.max_history_pairs,
+            separate_histories: config.llm.separate_histories,
             temperature: config.llm.temperature,
             max_tokens: config.llm.max_tokens,
+            timeout_sec: config.llm.timeout_sec,
+            coding_temperature: config.llm.coding_temperature,
+            coding_max_tokens: config.llm.coding_max_tokens,
+            coding_timeout_sec: config.llm.coding_timeout_sec,
             rag_enabled: config.knowledge.enabled,
             rag_embedding_provider: "openrouter",
             rag_embedding_model: config.knowledge.embedding.model.clone(),
@@ -756,6 +962,8 @@ impl From<&Config> for ConfigurationSnapshot {
 
 #[derive(Default)]
 struct RequestMetrics {
+    mode: String,
+    speaker: String,
     question: String,
     flush_reason: String,
     answer: String,
@@ -792,14 +1000,18 @@ struct RetrievalMetrics {
 
 #[derive(Serialize)]
 struct RetrievalHitMetrics {
+    id: String,
     source: String,
     heading: String,
+    text: String,
     score: f32,
 }
 
 #[derive(Serialize)]
 struct RequestSummary {
     request_id: u64,
+    mode: String,
+    speaker: String,
     question: String,
     flush_reason: String,
     answer: String,
@@ -846,6 +1058,8 @@ impl RequestSummary {
             });
         Self {
             request_id,
+            mode: metrics.mode,
+            speaker: metrics.speaker,
             question_chars: metrics.question.chars().count(),
             question_words: word_count(&metrics.question),
             answer_chars: metrics.answer_chars,
@@ -1410,11 +1624,13 @@ mod tests {
     use super::*;
     use crate::{
         config::{
-            AudioConfig, DeepgramConfig, EmbeddingConfig, KnowledgeConfig, LlmConfig,
-            ScreenshotConfig, SecretString, TranscriptConfig, VisionConfig,
+            AudioConfig, CandidateAudioConfig, DeepgramConfig, EmbeddingConfig, KnowledgeConfig,
+            LlmConfig, ScreenshotConfig, SecretString, SessionLogConfig, TranscriptConfig,
+            VisionConfig,
         },
         events::{
-            AnswerMeta, KnowledgeContext, KnowledgeSnippet, Mode, RetrievalView, TranscriptView,
+            AnswerMeta, KnowledgeContext, KnowledgeSnippet, Mode, RetrievalView, Speaker,
+            TranscriptView,
         },
     };
 
@@ -1456,38 +1672,48 @@ mod tests {
         .expect("recorder must start");
 
         recorder
-            .record(&OutputEvent::SttObservation(
-                SttObservation::SpeechStarted {
+            .record(&OutputEvent::SttObservation {
+                speaker: Speaker::Interviewer,
+                observation: SttObservation::SpeechStarted {
                     audio_timestamp_ms: Some(100),
                 },
-            ))
+            })
             .expect("speech start must be recorded");
         recorder
-            .record(&OutputEvent::SttObservation(SttObservation::Transcript {
-                text: "Что такое HashMap?".to_owned(),
-                is_final: true,
-                speech_final: true,
-                speech_final_deferred: false,
-                audio_start_ms: Some(100),
-                audio_duration_ms: Some(900),
-                last_word_end_ms: Some(900),
-            }))
+            .record(&OutputEvent::SttObservation {
+                speaker: Speaker::Interviewer,
+                observation: SttObservation::Transcript {
+                    text: "Что такое HashMap?".to_owned(),
+                    is_final: true,
+                    speech_final: true,
+                    speech_final_deferred: false,
+                    audio_start_ms: Some(100),
+                    audio_duration_ms: Some(900),
+                    last_word_end_ms: Some(900),
+                },
+            })
             .expect("transcript must be recorded");
         recorder
-            .record(&OutputEvent::SttObservation(SttObservation::UtteranceEnd {
-                last_word_end_ms: Some(1_000),
-                ignored: false,
-                deferred: false,
-            }))
+            .record(&OutputEvent::SttObservation {
+                speaker: Speaker::Interviewer,
+                observation: SttObservation::UtteranceEnd {
+                    last_word_end_ms: Some(1_000),
+                    ignored: false,
+                    deferred: false,
+                },
+            })
             .expect("utterance end must be recorded");
         recorder
             .record(&OutputEvent::TranscriptDraft {
+                speaker: Speaker::Interviewer,
                 text: "Что такое HashMap?".to_owned(),
             })
             .expect("draft must be recorded");
         recorder
             .record(&OutputEvent::Transcript(TranscriptView {
                 sequence: 0,
+                mode: Mode::Voice,
+                speaker: Speaker::Interviewer,
                 text: "Что такое HashMap?".to_owned(),
                 flush_reason: "timer".to_owned(),
             }))
@@ -1520,6 +1746,7 @@ mod tests {
             .record(&OutputEvent::AnswerStarted(AnswerMeta {
                 request_id: 0,
                 mode: Mode::Voice,
+                speaker: Speaker::Interviewer,
             }))
             .expect("request start must be recorded");
         recorder
@@ -1650,6 +1877,9 @@ mod tests {
                 temperature: 0.2,
                 max_tokens: 450,
                 timeout_sec: 30,
+                coding_temperature: 0.1,
+                coding_max_tokens: 1_800,
+                coding_timeout_sec: 60,
                 current_project: "test".to_owned(),
             },
             vision: VisionConfig {
@@ -1665,6 +1895,10 @@ mod tests {
                 source: "default".to_owned(),
                 chunk_ms: 100,
                 queue_max: 0,
+            },
+            candidate_audio: CandidateAudioConfig {
+                enabled: true,
+                source: "default-mic".to_owned(),
             },
             transcript: TranscriptConfig {
                 window_sec: 5,
@@ -1694,6 +1928,10 @@ mod tests {
                 pid_file: PathBuf::from("/tmp/test.pid"),
                 max_image_mb: 3.5,
                 debounce_sec: 1,
+            },
+            session_log: SessionLogConfig {
+                enabled: true,
+                directory: PathBuf::from("telemetry/sessions"),
             },
         }
     }

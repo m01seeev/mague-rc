@@ -366,7 +366,7 @@ async fn complete(
     let mut first_token = None;
     let mut answer = String::new();
     let mut usage = None;
-    let mut stream = provider.stream(ChatRequest { messages });
+    let mut stream = provider.stream(ChatRequest::new(messages));
 
     while let Some(event) = stream.next().await {
         match event? {

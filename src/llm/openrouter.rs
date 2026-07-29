@@ -39,8 +39,8 @@ impl TextLlmProvider for OpenRouterTextProvider {
         let endpoint = self.endpoint.clone();
         let api_key = self.config.api_key.clone();
         let model = self.config.model.clone();
-        let temperature = self.config.temperature;
-        let max_tokens = self.config.max_tokens;
+        let temperature = request.temperature.unwrap_or(self.config.temperature);
+        let max_tokens = request.max_tokens.unwrap_or(self.config.max_tokens);
 
         Box::pin(try_stream! {
             let body = ChatCompletionRequest {
@@ -348,12 +348,14 @@ mod tests {
             temperature: 0.2,
             max_tokens: 450,
             timeout_sec: 1,
+            coding_temperature: 0.1,
+            coding_max_tokens: 1_800,
+            coding_timeout_sec: 2,
             current_project: "АО Консалт Плюс".to_owned(),
         };
         let provider = OpenRouterTextProvider::new(config).expect("provider must build");
-        let mut stream = provider.stream(ChatRequest {
-            messages: vec![ChatMessage::system("system")],
-        });
+        let mut stream =
+            provider.stream(ChatRequest::new(vec![ChatMessage::system("system")]));
         let mut response = String::new();
         let mut usage = None;
         while let Some(event) = stream.next().await {

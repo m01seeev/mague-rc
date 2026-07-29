@@ -49,12 +49,14 @@ fn update_stats(stats: &mut OutputStats, event: &OutputEvent) {
         OutputEvent::Error(error) if error.component == crate::events::OutputComponent::Llm => {
             stats.failed += 1;
         }
-        OutputEvent::SttObservation(_)
+        OutputEvent::SttObservation { .. }
+        | OutputEvent::ModeChanged { .. }
         | OutputEvent::TranscriptDraft { .. }
         | OutputEvent::Retrieval(_)
         | OutputEvent::LlmQueued { .. }
         | OutputEvent::AnswerDelta { .. }
         | OutputEvent::AnswerUsage { .. }
+        | OutputEvent::LiveCodingUpdated(_)
         | OutputEvent::QueueState(_)
         | OutputEvent::Error(_) => {}
     }
@@ -62,7 +64,7 @@ fn update_stats(stats: &mut OutputStats, event: &OutputEvent) {
 
 #[cfg(test)]
 mod tests {
-    use crate::events::{AnswerMeta, Mode};
+    use crate::events::{AnswerMeta, Mode, Speaker};
 
     use super::*;
 
@@ -74,6 +76,7 @@ mod tests {
             .send(OutputEvent::AnswerStarted(AnswerMeta {
                 request_id: 2,
                 mode: Mode::Voice,
+                speaker: Speaker::Interviewer,
             }))
             .expect("source channel must be open");
         source_sender

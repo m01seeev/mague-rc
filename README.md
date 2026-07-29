@@ -50,6 +50,36 @@ cargo run
 
 This opens a GTK4 layer-shell panel centered along the top edge of the active output. The panel stays above regular windows without taking keyboard focus and keeps a scrollable history of questions and streaming answers. Its controls pause/resume recognition, clear the visible and LLM conversation history, collapse/expand the panel, and shut the pipeline down cleanly. Pausing prevents new questions and answers while keeping audio capture and the Deepgram connection alive. The overlay also toggles between its full and collapsed sizes on `SIGUSR2`; its PID is written to `/tmp/mague-rc-overlay.pid` for a compositor hotkey.
 
+The app opens two independent audio/STT pipelines. `AUDIO_SOURCE` captures the interviewer from the system-output monitor and is labelled `interviewer`; `CANDIDATE_MIC_SOURCE` captures the microphone and is labelled `candidate`. Interviewer speech produces a ready-to-say answer. Candidate speech produces direct coaching, so saying that something is unclear or asking for a hint is handled as a request from the candidate, never as a new interviewer requirement. Use headphones to prevent the interviewer audio from leaking into the microphone channel. Disable the second pipeline with `CANDIDATE_MIC_ENABLED=false`.
+
+The `LIVE CODING` tab reuses both capture/STT channels, utterance segmentation, and the text model. It deliberately skips RAG and conversation history. Each completed segment is sent with the speaker label, current canonical summary, candidate context, and stable code; the model returns updated state and full candidate code when needed. The previous code remains visible until the complete JSON response is validated, then the overlay promotes the candidate and highlights locally computed changed lines.
+
+In live-coding mode, interviewer speech is the only source allowed to change the canonical task requirements. Candidate speech updates a separate candidate context and can ask for an explanation, propose an approach, or request a code change without being mistaken for part of the task.
+
+`F10` toggles between `INTERVIEW` and `LIVE CODING` through `SIGWINCH`, without giving the overlay keyboard focus. Add this Hyprland binding:
+
+```ini
+bind = , F10, exec, test -r /tmp/mague-rc-overlay.pid && kill -WINCH "$(cat /tmp/mague-rc-overlay.pid)"
+```
+
+`CODING_TEMPERATURE`, `CODING_MAX_TOKENS`, and `CODING_TIMEOUT_SEC` control live-coding generation independently while keeping `MODEL_TEXT` as the shared model. Clearing history also resets the canonical live-coding state.
+
+### Training session logs
+
+Normal overlay runs record durable local training sessions by default. Every launch creates two ignored files under `telemetry/sessions/`:
+
+- `*.events.jsonl` is flushed after every event and remains useful if the process crashes. It contains explicit `interviewer`/`candidate` labels, mode changes, raw and final STT transcripts, segmentation boundaries, submitted questions, complete interview answers, token usage, latency, errors, attached RAG context, and every live-coding summary, candidate context, TALK TRACK, code revision, and change note.
+- `*.summary.json` is written on graceful shutdown. It collects requests, answers, utterances, aggregate timing and cost, and the full sequence of live-coding revisions for easier analysis.
+
+The recorder stores text and generated code but never API keys or raw audio. These files can contain private speech and knowledge snippets, so keep them local. Disable recording with `SESSION_LOG_ENABLED=false` or move it with `SESSION_LOG_DIR=/private/path`.
+
+After a training session, inspect the newest artifacts with:
+
+```bash
+ls -lt telemetry/sessions/
+jq '.requests, .live_coding, .aggregates' telemetry/sessions/*.summary.json
+```
+
 For the diagnostic terminal output instead:
 
 ```bash
@@ -225,6 +255,6 @@ cargo test
 
 ## Current scope
 
-Implemented: typed configuration, redacted secrets, continuous PCM capture through `ffmpeg`, bounded/unbounded queues with backpressure, authenticated Deepgram WebSocket streaming, keepalive, final/interim event parsing, ordered reconnect with retry, utterance-boundary segmentation with an inactivity fallback, interim-prefetched OpenRouter semantic retrieval with a local index, context-grounded sequential OpenRouter streaming, timeout handling, four-pair voice history, unified output events, terminal output without interleaved streaming responses, a Hyprland-compatible layer-shell overlay, streaming UI updates, pipeline controls, structured diagnostics, repeatable file benchmarks with JSONL telemetry and WER/CER/RAG measurements, and graceful shutdown.
+Implemented: typed configuration, redacted secrets, continuous PCM capture through `ffmpeg`, bounded/unbounded queues with backpressure, authenticated Deepgram WebSocket streaming, keepalive, final/interim event parsing, ordered reconnect with retry, utterance-boundary segmentation with an inactivity fallback, interim-prefetched OpenRouter semantic retrieval with a local index, context-grounded sequential OpenRouter streaming, stateful live-coding without RAG or chat history, atomic stable-code promotion with changed-line highlighting, timeout handling, four-pair voice history, unified output events, terminal output without interleaved streaming responses, a Hyprland-compatible layer-shell overlay, streaming UI updates, pipeline controls, structured diagnostics, repeatable file benchmarks with JSONL telemetry and WER/CER/RAG measurements, and graceful shutdown.
 
 Not implemented: knowledge management in the overlay, OCR, and screenshot flow. Seamless presenter-mode capture exclusion is available externally through the patched `hyprland-presenter` package described above; `mague-rc` itself does not modify the compositor.

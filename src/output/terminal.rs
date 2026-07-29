@@ -51,7 +51,11 @@ impl TerminalRenderer {
             OutputEvent::AnswerStarted(meta) if self.active_answer.is_none() => {
                 self.stats.started += 1;
                 self.active_answer = Some(meta.request_id);
-                writeln!(writer, "\nANSWER #{} [{}]", meta.request_id, meta.mode)?;
+                writeln!(
+                    writer,
+                    "\nANSWER #{} [{} · {}]",
+                    meta.request_id, meta.mode, meta.speaker
+                )?;
             }
             OutputEvent::AnswerDelta { request_id, text }
                 if self.active_answer == Some(request_id) =>
@@ -75,7 +79,7 @@ impl TerminalRenderer {
                 writeln!(writer, "ERROR [{}]: {}", error.component, error.message)?;
                 self.flush_pending(writer)?;
             }
-            OutputEvent::SttObservation(_)
+            OutputEvent::SttObservation { .. }
             | OutputEvent::TranscriptDraft { .. }
             | OutputEvent::Retrieval(_)
             | OutputEvent::LlmQueued { .. }
@@ -103,6 +107,9 @@ impl TerminalRenderer {
         event: OutputEvent,
     ) -> Result<(), io::Error> {
         match event {
+            OutputEvent::ModeChanged { mode } => {
+                writeln!(writer, "[mode] {mode}")?;
+            }
             OutputEvent::Status(status) => {
                 self.stats.statuses += 1;
                 let label = match status.kind {
@@ -120,19 +127,36 @@ impl TerminalRenderer {
                 self.stats.transcripts += 1;
                 writeln!(
                     writer,
-                    "\nQUESTION #{}: {}",
-                    transcript.sequence, transcript.text
+                    "\n{} #{}: {}",
+                    transcript.speaker.to_string().to_uppercase(),
+                    transcript.sequence,
+                    transcript.text
                 )?;
             }
-            OutputEvent::SttObservation(_)
+            OutputEvent::SttObservation { .. }
             | OutputEvent::TranscriptDraft { .. }
             | OutputEvent::Retrieval(_)
             | OutputEvent::LlmQueued { .. }
             | OutputEvent::AnswerUsage { .. } => {}
+            OutputEvent::LiveCodingUpdated(state) => {
+                writeln!(
+                    writer,
+                    "\nLIVE CODING r{} [{}]\n{}\n\nTALK TRACK\n{}\n\n{}",
+                    state.revision,
+                    state.language,
+                    state.summary,
+                    state.explanation,
+                    state.code
+                )?;
+            }
             OutputEvent::AnswerStarted(meta) => {
                 self.stats.started += 1;
                 self.active_answer = Some(meta.request_id);
-                writeln!(writer, "\nANSWER #{} [{}]", meta.request_id, meta.mode)?;
+                writeln!(
+                    writer,
+                    "\nANSWER #{} [{} · {}]",
+                    meta.request_id, meta.mode, meta.speaker
+                )?;
             }
             OutputEvent::AnswerDelta { .. } | OutputEvent::AnswerCompleted { .. } => {}
             OutputEvent::QueueState(queue) if queue.len > 1 => {
@@ -153,7 +177,7 @@ impl TerminalRenderer {
 #[cfg(test)]
 mod tests {
     use crate::events::{
-        AnswerMeta, AppErrorView, Mode, OutputComponent, StatusMessage, TranscriptView,
+        AnswerMeta, AppErrorView, Mode, OutputComponent, Speaker, StatusMessage, TranscriptView,
     };
 
     use super::*;
@@ -169,6 +193,7 @@ mod tests {
                 OutputEvent::AnswerStarted(AnswerMeta {
                     request_id: 7,
                     mode: Mode::Voice,
+                    speaker: Speaker::Interviewer,
                 }),
             )
             .expect("started event must render");
@@ -196,7 +221,7 @@ mod tests {
 
         assert_eq!(
             String::from_utf8(output).expect("output must be UTF-8"),
-            "\nANSWER #7 [voice]\nпервая вторая\n"
+            "\nANSWER #7 [voice · interviewer]\nпервая вторая\n"
         );
         assert_eq!(renderer.stats.started, 1);
         assert_eq!(renderer.stats.completed, 1);
@@ -213,6 +238,7 @@ mod tests {
                 OutputEvent::AnswerStarted(AnswerMeta {
                     request_id: 3,
                     mode: Mode::Voice,
+                    speaker: Speaker::Interviewer,
                 }),
             )
             .expect("answer must start");
@@ -239,6 +265,8 @@ mod tests {
                 &mut output,
                 OutputEvent::Transcript(TranscriptView {
                     sequence: 4,
+                    mode: Mode::Voice,
+                    speaker: Speaker::Interviewer,
                     text: "Следующий вопрос".to_owned(),
                     flush_reason: "test".to_owned(),
                 }),
@@ -250,9 +278,9 @@ mod tests {
 
         assert_eq!(
             String::from_utf8(output).expect("output must be UTF-8"),
-            "\nANSWER #3 [voice]\nцельный ответ\n\
+            "\nANSWER #3 [voice · interviewer]\nцельный ответ\n\
              [reconnecting] Deepgram reconnect in 1s\n\
-             \nQUESTION #4: Следующий вопрос\n"
+             \nINTERVIEWER #4: Следующий вопрос\n"
         );
     }
 
@@ -267,6 +295,7 @@ mod tests {
                 OutputEvent::AnswerStarted(AnswerMeta {
                     request_id: 9,
                     mode: Mode::Voice,
+                    speaker: Speaker::Interviewer,
                 }),
             )
             .expect("answer must start");
@@ -291,7 +320,7 @@ mod tests {
 
         assert_eq!(
             String::from_utf8(output).expect("output must be UTF-8"),
-            "\nANSWER #9 [voice]\n\n\
+            "\nANSWER #9 [voice · interviewer]\n\n\
              ERROR [llm]: request #9 failed: timeout\n\
              [listening] Deepgram connected\n"
         );

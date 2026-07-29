@@ -50,9 +50,11 @@ pub struct TranscriptChunk {
     pub text: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mode {
+    #[default]
     Voice,
+    LiveCoding,
     Ocr,
 }
 
@@ -60,7 +62,24 @@ impl fmt::Display for Mode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Voice => formatter.write_str("voice"),
+            Self::LiveCoding => formatter.write_str("live-coding"),
             Self::Ocr => formatter.write_str("ocr"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Speaker {
+    #[default]
+    Interviewer,
+    Candidate,
+}
+
+impl fmt::Display for Speaker {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Interviewer => formatter.write_str("interviewer"),
+            Self::Candidate => formatter.write_str("candidate"),
         }
     }
 }
@@ -69,6 +88,7 @@ impl fmt::Display for Mode {
 pub struct LlmRequest {
     pub request_id: u64,
     pub mode: Mode,
+    pub speaker: Speaker,
     pub text: String,
     pub knowledge: Option<KnowledgeContext>,
 }
@@ -120,8 +140,30 @@ pub struct StatusMessage {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TranscriptView {
     pub sequence: u64,
+    pub mode: Mode,
+    pub speaker: Speaker,
     pub text: String,
     pub flush_reason: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LiveCodingState {
+    pub revision: u64,
+    pub summary: String,
+    pub candidate_context: String,
+    pub explanation: String,
+    pub language: String,
+    pub code: String,
+    pub change_note: String,
+    pub changed_lines: Vec<usize>,
+    pub code_edits: Vec<CodeEdit>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeEdit {
+    pub start_offset: usize,
+    pub end_offset: usize,
+    pub replacement: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -158,6 +200,7 @@ pub struct LlmUsage {
 pub struct AnswerMeta {
     pub request_id: u64,
     pub mode: Mode,
+    pub speaker: Speaker,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -211,8 +254,15 @@ pub struct AppErrorView {
 #[derive(Clone, Debug, PartialEq)]
 pub enum OutputEvent {
     Status(StatusMessage),
-    SttObservation(SttObservation),
-    TranscriptDraft { text: String },
+    ModeChanged { mode: Mode },
+    SttObservation {
+        speaker: Speaker,
+        observation: SttObservation,
+    },
+    TranscriptDraft {
+        speaker: Speaker,
+        text: String,
+    },
     Transcript(TranscriptView),
     Retrieval(RetrievalView),
     LlmQueued { request_id: u64 },
@@ -220,6 +270,7 @@ pub enum OutputEvent {
     AnswerDelta { request_id: u64, text: String },
     AnswerUsage { request_id: u64, usage: LlmUsage },
     AnswerCompleted { request_id: u64 },
+    LiveCodingUpdated(LiveCodingState),
     QueueState(QueueState),
     Error(AppErrorView),
 }
@@ -233,6 +284,7 @@ pub enum LlmCommand {
 pub enum AppCommand {
     PauseListening,
     ResumeListening,
+    ToggleLiveCoding,
     ClearHistory,
     Shutdown,
 }

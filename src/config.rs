@@ -47,9 +47,11 @@ pub struct Config {
     pub llm: LlmConfig,
     pub vision: VisionConfig,
     pub audio: AudioConfig,
+    pub candidate_audio: CandidateAudioConfig,
     pub transcript: TranscriptConfig,
     pub knowledge: KnowledgeConfig,
     pub screenshot: ScreenshotConfig,
+    pub session_log: SessionLogConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -80,6 +82,9 @@ pub struct LlmConfig {
     pub temperature: f32,
     pub max_tokens: u32,
     pub timeout_sec: u64,
+    pub coding_temperature: f32,
+    pub coding_max_tokens: u32,
+    pub coding_timeout_sec: u64,
     pub current_project: String,
 }
 
@@ -99,6 +104,12 @@ pub struct AudioConfig {
     pub source: String,
     pub chunk_ms: u64,
     pub queue_max: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct CandidateAudioConfig {
+    pub enabled: bool,
+    pub source: String,
 }
 
 #[derive(Clone, Debug)]
@@ -137,6 +148,12 @@ pub struct ScreenshotConfig {
     pub pid_file: PathBuf,
     pub max_image_mb: f32,
     pub debounce_sec: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionLogConfig {
+    pub enabled: bool,
+    pub directory: PathBuf,
 }
 
 #[derive(Debug, Error)]
@@ -200,6 +217,9 @@ impl Config {
                 temperature: reader.parse("TEXT_TEMPERATURE", 0.2)?,
                 max_tokens: reader.parse("TEXT_MAX_TOKENS", 450)?,
                 timeout_sec: reader.parse("TEXT_TIMEOUT_SEC", 30)?,
+                coding_temperature: reader.parse("CODING_TEMPERATURE", 0.1)?,
+                coding_max_tokens: reader.parse("CODING_MAX_TOKENS", 1_800)?,
+                coding_timeout_sec: reader.parse("CODING_TIMEOUT_SEC", 60)?,
                 current_project: reader.string("CURRENT_PROJECT", "АО Консалт Плюс"),
             },
             vision: VisionConfig {
@@ -215,6 +235,10 @@ impl Config {
                 source: reader.string("AUDIO_SOURCE", "@DEFAULT_AUDIO_SINK@.monitor"),
                 chunk_ms: reader.parse("AUDIO_CHUNK_MS", 100)?,
                 queue_max: reader.parse("AUDIO_QUEUE_MAX", 0)?,
+            },
+            candidate_audio: CandidateAudioConfig {
+                enabled: reader.boolean("CANDIDATE_MIC_ENABLED", true)?,
+                source: reader.string("CANDIDATE_MIC_SOURCE", "@DEFAULT_SOURCE@"),
             },
             transcript: TranscriptConfig {
                 window_sec: reader.parse("TRANSCRIPT_WINDOW_SEC", 5)?,
@@ -236,6 +260,12 @@ impl Config {
                 pid_file: PathBuf::from(reader.string("PID_FILE", "/tmp/ai_overlay.pid")),
                 max_image_mb: reader.parse("OCR_MAX_IMAGE_MB", 3.5)?,
                 debounce_sec: reader.parse("OCR_DEBOUNCE_SEC", 1)?,
+            },
+            session_log: SessionLogConfig {
+                enabled: reader.boolean("SESSION_LOG_ENABLED", true)?,
+                directory: PathBuf::from(
+                    reader.string("SESSION_LOG_DIR", "telemetry/sessions"),
+                ),
             },
         };
 
@@ -278,6 +308,14 @@ impl Config {
         finite_range("TEXT_TEMPERATURE", self.llm.temperature, 0.0, 2.0)?;
         positive("TEXT_MAX_TOKENS", self.llm.max_tokens)?;
         positive("TEXT_TIMEOUT_SEC", self.llm.timeout_sec)?;
+        finite_range(
+            "CODING_TEMPERATURE",
+            self.llm.coding_temperature,
+            0.0,
+            2.0,
+        )?;
+        positive("CODING_MAX_TOKENS", self.llm.coding_max_tokens)?;
+        positive("CODING_TIMEOUT_SEC", self.llm.coding_timeout_sec)?;
         non_empty("CURRENT_PROJECT", &self.llm.current_project)?;
 
         non_empty("MODEL_VISION", &self.vision.model)?;
@@ -288,6 +326,9 @@ impl Config {
         non_empty("AUDIO_INPUT_FORMAT", &self.audio.input_format)?;
         non_empty("AUDIO_SOURCE", &self.audio.source)?;
         in_range("AUDIO_CHUNK_MS", self.audio.chunk_ms, 10, 10_000)?;
+        if self.candidate_audio.enabled {
+            non_empty("CANDIDATE_MIC_SOURCE", &self.candidate_audio.source)?;
+        }
 
         in_range(
             "TRANSCRIPT_WINDOW_SEC",
@@ -312,6 +353,9 @@ impl Config {
             f32::EPSILON,
         )?;
         positive("OCR_DEBOUNCE_SEC", self.screenshot.debounce_sec)?;
+        if self.session_log.enabled {
+            non_empty_path("SESSION_LOG_DIR", &self.session_log.directory)?;
+        }
 
         Ok(())
     }

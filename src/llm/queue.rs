@@ -134,7 +134,7 @@ mod tests {
 
     use tokio::time::timeout;
 
-    use crate::events::Mode;
+    use crate::events::{Mode, Speaker};
 
     use super::*;
 
@@ -142,6 +142,7 @@ mod tests {
         LlmRequest {
             request_id,
             mode: Mode::Voice,
+            speaker: Speaker::Interviewer,
             text: format!("request {request_id}"),
             knowledge: None,
         }

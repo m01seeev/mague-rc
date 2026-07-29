@@ -11,8 +11,8 @@ use std::{
 use futures_util::StreamExt;
 use gtk::{
     Align, Application, ApplicationWindow, Box as GtkBox, Button, CssProvider, Image, Label,
-    Orientation, PolicyType, STYLE_PROVIDER_PRIORITY_APPLICATION, ScrolledWindow, Separator, gdk,
-    gio, glib, prelude::*,
+    Orientation, PolicyType, STYLE_PROVIDER_PRIORITY_APPLICATION, ScrolledWindow, Separator, Stack,
+    TextBuffer, TextView, gdk, gio, glib, prelude::*,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use thiserror::Error;
@@ -21,17 +21,21 @@ use tokio::sync::mpsc as tokio_mpsc;
 use crate::{
     app,
     config::Config,
-    events::{AppCommand, AppErrorView, OutputComponent, OutputEvent, StatusKind, StatusMessage},
+    events::{
+        AppCommand, AppErrorView, LiveCodingState, Mode, OutputComponent, OutputEvent, StatusKind,
+        StatusMessage,
+    },
     output::{
         AnswerStatus, AppSnapshot, ChannelOutputSink, ConnectionStatus, ConversationTurn,
         WorkerStatus,
     },
+    telemetry::TelemetryOutputSink,
 };
 
 const APPLICATION_ID: &str = "io.github.mague_rc.Overlay";
 const NAMESPACE: &str = "mague-rc-overlay";
-const WIDTH: i32 = 760;
-const HEIGHT: i32 = 600;
+const WIDTH: i32 = 1120;
+const HEIGHT: i32 = 900;
 const COLLAPSED_WIDTH: i32 = 420;
 const COLLAPSED_HEIGHT: i32 = 52;
 const CONTROL_PID_FILE: &str = "/tmp/mague-rc-overlay.pid";
@@ -98,6 +102,7 @@ fn control_pid_path() -> PathBuf {
 
 struct OverlayState {
     snapshot: AppSnapshot,
+    live_coding: LiveCodingState,
     status: String,
     paused: bool,
     collapsed: bool,
@@ -109,6 +114,7 @@ impl OverlayState {
     fn new(commands: tokio_mpsc::UnboundedSender<AppCommand>) -> Self {
         Self {
             snapshot: AppSnapshot::default(),
+            live_coding: LiveCodingState::default(),
             status: String::from("Starting"),
             paused: false,
             collapsed: false,
@@ -137,20 +143,44 @@ impl OverlayState {
         );
 
         match event {
+            OutputEvent::ModeChanged { mode } => {
+                self.status = match mode {
+                    Mode::LiveCoding => String::from("Live coding"),
+                    Mode::Voice | Mode::Ocr => String::from("Listening"),
+                };
+            }
             OutputEvent::Status(status) => {
                 self.status = status_label(status.kind).to_owned();
                 match status.kind {
                     StatusKind::Paused => self.paused = true,
                     StatusKind::Listening => self.paused = false,
+                    StatusKind::HistoryCleared => {
+                        self.live_coding = LiveCodingState::default();
+                    }
                     _ => {}
                 }
             }
             OutputEvent::Error(error) if error.component != OutputComponent::Knowledge => {
                 self.status = String::from("Error");
             }
-            OutputEvent::AnswerStarted(_) => self.status = String::from("Thinking"),
+            OutputEvent::AnswerStarted(meta) => {
+                self.status = if meta.mode == Mode::LiveCoding {
+                    if meta.speaker == crate::events::Speaker::Candidate {
+                        String::from("Coaching")
+                    } else {
+                        String::from("Updating code")
+                    }
+                } else if meta.speaker == crate::events::Speaker::Candidate {
+                    String::from("Coaching")
+                } else {
+                    String::from("Thinking")
+                };
+            }
             OutputEvent::AnswerCompleted { .. } if !self.paused => {
                 self.status = String::from("Listening");
+            }
+            OutputEvent::LiveCodingUpdated(updated) => {
+                self.live_coding.clone_from(updated);
             }
             _ => {}
         }
@@ -173,11 +203,25 @@ struct OverlayWidgets {
     status_label: Label,
     pause_icon: Image,
     history: ConversationHistoryWidgets,
+    mode_stack: Stack,
+    interview_tab: Button,
+    coding_tab: Button,
+    live_coding: LiveCodingWidgets,
     footer: Label,
     queue: Label,
     collapse_button: Button,
     collapse_icon: Image,
     body: GtkBox,
+}
+
+#[derive(Clone)]
+struct LiveCodingWidgets {
+    revision: Label,
+    explanation: Label,
+    summary: Label,
+    language: Label,
+    change_note: Label,
+    code: TextView,
 }
 
 #[derive(Clone)]
@@ -228,6 +272,23 @@ fn spawn_pipeline(
                 .build();
 
             let result = match runtime {
+                Ok(runtime) if config.session_log.enabled => {
+                    let sink = TelemetryOutputSink::new_session(
+                        ChannelOutputSink::new(output_sender),
+                        &config.session_log.directory,
+                        "training",
+                        &config,
+                    )
+                    .map_err(|error| crate::error::AppError::Output(error.to_string()));
+                    match sink {
+                        Ok(sink) => runtime.block_on(app::run_with_sink(
+                            config,
+                            sink,
+                            command_receiver,
+                        )),
+                        Err(error) => Err(error),
+                    }
+                }
                 Ok(runtime) => runtime.block_on(app::run_with_sink(
                     config,
                     ChannelOutputSink::new(output_sender),
@@ -323,6 +384,7 @@ fn create_widgets(application: &Application, state: Rc<RefCell<OverlayState>>) -
 
     let root = GtkBox::new(Orientation::Vertical, 0);
     root.add_css_class("panel");
+    root.set_cursor_from_name(Some("default"));
     window.set_child(Some(&root));
 
     let header = GtkBox::new(Orientation::Horizontal, 8);
@@ -411,6 +473,18 @@ fn create_widgets(application: &Application, state: Rc<RefCell<OverlayState>>) -
     body.set_vexpand(true);
     root.append(&body);
 
+    let mode_tabs = GtkBox::new(Orientation::Horizontal, 6);
+    mode_tabs.add_css_class("mode-tabs");
+    mode_tabs.set_margin_top(8);
+    mode_tabs.set_margin_start(12);
+    mode_tabs.set_margin_end(12);
+    mode_tabs.set_margin_bottom(8);
+    let interview_tab = mode_button("INTERVIEW", "Use interview Q&A mode");
+    let coding_tab = mode_button("LIVE CODING", "Use stateful live-coding mode · F10");
+    mode_tabs.append(&interview_tab);
+    mode_tabs.append(&coding_tab);
+    body.append(&mode_tabs);
+
     let history_container = GtkBox::new(Orientation::Vertical, 0);
     let history_empty = Label::new(Some("Listening for a question"));
     history_empty.add_css_class("empty-history");
@@ -440,7 +514,138 @@ fn create_widgets(application: &Application, state: Rc<RefCell<OverlayState>>) -
         .child(&history_container)
         .build();
     configure_follow_tail(&history_scroll);
-    body.append(&history_scroll);
+
+    let coding_page = GtkBox::new(Orientation::Vertical, 0);
+    coding_page.add_css_class("coding-page");
+
+    let coding_meta = GtkBox::new(Orientation::Horizontal, 8);
+    coding_meta.set_margin_start(16);
+    coding_meta.set_margin_end(12);
+    coding_meta.set_margin_bottom(8);
+    let revision = Label::new(Some("STATE r0"));
+    revision.add_css_class("coding-revision");
+    revision.set_halign(Align::Start);
+    coding_meta.append(&revision);
+    let coding_meta_spacer = GtkBox::new(Orientation::Horizontal, 0);
+    coding_meta_spacer.set_hexpand(true);
+    coding_meta.append(&coding_meta_spacer);
+    let language = Label::new(Some("JAVA"));
+    language.add_css_class("coding-language");
+    coding_meta.append(&language);
+    let copy_button = icon_button("edit-copy-symbolic", "Copy stable code");
+    {
+        let state = Rc::clone(&state);
+        copy_button.connect_clicked(move |_| {
+            let code = state.borrow().live_coding.code.clone();
+            if !code.is_empty()
+                && let Some(display) = gdk::Display::default()
+            {
+                display.clipboard().set_text(&code);
+            }
+        });
+    }
+    coding_meta.append(&copy_button);
+    coding_page.append(&coding_meta);
+
+    let coding_workspace = GtkBox::new(Orientation::Horizontal, 0);
+    coding_workspace.add_css_class("coding-workspace");
+    coding_workspace.set_vexpand(true);
+
+    let context_column = GtkBox::new(Orientation::Vertical, 10);
+    context_column.add_css_class("coding-context");
+    context_column.set_width_request(380);
+    context_column.set_margin_start(16);
+    context_column.set_margin_end(14);
+    context_column.set_margin_bottom(14);
+
+    let explanation_root = GtkBox::new(Orientation::Vertical, 5);
+    explanation_root.add_css_class("coding-state-block");
+    explanation_root.add_css_class("coding-talk-block");
+    explanation_root.set_vexpand(true);
+    explanation_root.append(&section_title("TALK TRACK", true));
+    let explanation = content_label(
+        "A short explanation will appear with the solution",
+        "coding-explanation",
+    );
+    let explanation_scroll = ScrolledWindow::builder()
+        .hscrollbar_policy(PolicyType::Never)
+        .vscrollbar_policy(PolicyType::Automatic)
+        .vexpand(true)
+        .child(&explanation)
+        .build();
+    explanation_scroll.add_css_class("coding-text-scroll");
+    explanation_root.append(&explanation_scroll);
+    context_column.append(&explanation_root);
+
+    let summary_root = GtkBox::new(Orientation::Vertical, 5);
+    summary_root.add_css_class("coding-state-block");
+    summary_root.set_vexpand(true);
+    summary_root.append(&section_title("CANONICAL STATE", false));
+    let summary = content_label("Summary will appear after the first task segment", "coding-summary");
+    let summary_scroll = ScrolledWindow::builder()
+        .hscrollbar_policy(PolicyType::Never)
+        .vscrollbar_policy(PolicyType::Automatic)
+        .vexpand(true)
+        .child(&summary)
+        .build();
+    summary_scroll.add_css_class("coding-text-scroll");
+    summary_root.append(&summary_scroll);
+    context_column.append(&summary_root);
+    coding_workspace.append(&context_column);
+    coding_workspace.append(&Separator::new(Orientation::Vertical));
+
+    let code_column = GtkBox::new(Orientation::Vertical, 0);
+    code_column.add_css_class("coding-editor");
+    code_column.set_hexpand(true);
+    let code_header = GtkBox::new(Orientation::Horizontal, 8);
+    code_header.set_margin_start(14);
+    code_header.set_margin_end(16);
+    code_header.set_margin_bottom(6);
+    code_header.append(&section_title("STABLE CODE", true));
+    let code_header_spacer = GtkBox::new(Orientation::Horizontal, 0);
+    code_header_spacer.set_hexpand(true);
+    code_header.append(&code_header_spacer);
+    let change_note = Label::new(Some("No generated code yet"));
+    change_note.add_css_class("coding-change-note");
+    change_note.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    code_header.append(&change_note);
+    code_column.append(&code_header);
+
+    let code_buffer = TextBuffer::new(None);
+    let _ = code_buffer.create_tag(
+        Some("changed-line"),
+        &[("paragraph-background", &"#17343a")],
+    );
+    let code = TextView::builder()
+        .buffer(&code_buffer)
+        .editable(false)
+        .cursor_visible(false)
+        .monospace(true)
+        .wrap_mode(gtk::WrapMode::None)
+        .left_margin(14)
+        .right_margin(14)
+        .top_margin(12)
+        .bottom_margin(12)
+        .build();
+    code.add_css_class("coding-code");
+    code.set_cursor_from_name(Some("default"));
+    let code_scroll = ScrolledWindow::builder()
+        .hscrollbar_policy(PolicyType::Automatic)
+        .vscrollbar_policy(PolicyType::Automatic)
+        .vexpand(true)
+        .child(&code)
+        .build();
+    code_scroll.add_css_class("coding-code-scroll");
+    code_column.append(&code_scroll);
+    coding_workspace.append(&code_column);
+    coding_page.append(&coding_workspace);
+
+    let mode_stack = Stack::new();
+    mode_stack.set_vexpand(true);
+    mode_stack.add_named(&history_scroll, Some("interview"));
+    mode_stack.add_named(&coding_page, Some("live-coding"));
+    mode_stack.set_visible_child_name("interview");
+    body.append(&mode_stack);
 
     let footer_row = GtkBox::new(Orientation::Horizontal, 8);
     footer_row.add_css_class("footer");
@@ -473,12 +678,43 @@ fn create_widgets(application: &Application, state: Rc<RefCell<OverlayState>>) -
             draft,
             turns: Rc::new(RefCell::new(Vec::new())),
         },
+        mode_stack,
+        interview_tab: interview_tab.clone(),
+        coding_tab: coding_tab.clone(),
+        live_coding: LiveCodingWidgets {
+            revision,
+            explanation,
+            summary,
+            language,
+            change_note,
+            code,
+        },
         footer,
         queue,
         collapse_button: collapse_button.clone(),
         collapse_icon,
         body: body.clone(),
     };
+    force_default_cursor(widgets.window.upcast_ref());
+
+    {
+        let state = Rc::clone(&state);
+        interview_tab.connect_clicked(move |_| {
+            let mut state = state.borrow_mut();
+            if state.snapshot.mode == Mode::LiveCoding {
+                state.send(AppCommand::ToggleLiveCoding);
+            }
+        });
+    }
+    {
+        let state = Rc::clone(&state);
+        coding_tab.connect_clicked(move |_| {
+            let mut state = state.borrow_mut();
+            if state.snapshot.mode != Mode::LiveCoding {
+                state.send(AppCommand::ToggleLiveCoding);
+            }
+        });
+    }
 
     {
         let state = Rc::clone(&state);
@@ -487,7 +723,7 @@ fn create_widgets(application: &Application, state: Rc<RefCell<OverlayState>>) -
             toggle_collapsed(&state, &widgets);
         });
     }
-    listen_for_toggle_signal(Rc::clone(&state), widgets.clone());
+    listen_for_control_signals(Rc::clone(&state), widgets.clone());
 
     let state_for_close = Rc::clone(&state);
     let status_for_close = status_label.clone();
@@ -505,7 +741,13 @@ fn create_widgets(application: &Application, state: Rc<RefCell<OverlayState>>) -
     widgets
 }
 
-fn listen_for_toggle_signal(state: Rc<RefCell<OverlayState>>, widgets: OverlayWidgets) {
+#[derive(Clone, Copy)]
+enum OverlayControl {
+    ToggleCollapsed,
+    ToggleLiveCoding,
+}
+
+fn listen_for_control_signals(state: Rc<RefCell<OverlayState>>, widgets: OverlayWidgets) {
     let (signal_sender, mut signal_receiver) = futures_channel::mpsc::unbounded();
     let spawn_result = thread::Builder::new()
         .name(String::from("mague-rc-overlay-control"))
@@ -518,16 +760,32 @@ fn listen_for_toggle_signal(state: Rc<RefCell<OverlayState>>, widgets: OverlayWi
                 return;
             };
             runtime.block_on(async move {
-                let signal = tokio::signal::unix::signal(
+                let collapse_signal = tokio::signal::unix::signal(
                     tokio::signal::unix::SignalKind::user_defined2(),
                 );
-                let Ok(mut signal) = signal else {
-                    tracing::error!("could not install overlay toggle signal handler");
+                let mode_signal = tokio::signal::unix::signal(
+                    tokio::signal::unix::SignalKind::window_change(),
+                );
+                let (Ok(mut collapse_signal), Ok(mut mode_signal)) =
+                    (collapse_signal, mode_signal)
+                else {
+                    tracing::error!("could not install overlay control signal handlers");
                     return;
                 };
-                while signal.recv().await.is_some() {
-                    if signal_sender.unbounded_send(()).is_err() {
-                        break;
+                loop {
+                    let control = tokio::select! {
+                        signal = collapse_signal.recv() => {
+                            signal.map(|_| OverlayControl::ToggleCollapsed)
+                        }
+                        signal = mode_signal.recv() => {
+                            signal.map(|_| OverlayControl::ToggleLiveCoding)
+                        }
+                    };
+                    let Some(control) = control else {
+                        return;
+                    };
+                    if signal_sender.unbounded_send(control).is_err() {
+                        return;
                     }
                 }
             });
@@ -545,8 +803,13 @@ fn listen_for_toggle_signal(state: Rc<RefCell<OverlayState>>, widgets: OverlayWi
     }
 
     glib::spawn_future_local(async move {
-        while signal_receiver.next().await.is_some() {
-            toggle_collapsed(&state, &widgets);
+        while let Some(control) = signal_receiver.next().await {
+            match control {
+                OverlayControl::ToggleCollapsed => toggle_collapsed(&state, &widgets),
+                OverlayControl::ToggleLiveCoding => {
+                    state.borrow_mut().send(AppCommand::ToggleLiveCoding);
+                }
+            }
         }
     });
 }
@@ -590,6 +853,15 @@ fn icon_button(icon_name: &str, tooltip: &str) -> Button {
         .height_request(34)
         .build();
     button.add_css_class("icon-button");
+    button.set_cursor_from_name(Some("default"));
+    button
+}
+
+fn mode_button(label: &str, tooltip: &str) -> Button {
+    let button = Button::with_label(label);
+    button.add_css_class("mode-tab");
+    button.set_tooltip_text(Some(tooltip));
+    button.set_cursor_from_name(Some("default"));
     button
 }
 
@@ -610,9 +882,19 @@ fn content_label(value: &str, css_class: &str) -> Label {
     label.set_wrap(true);
     label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
     label.set_xalign(0.0);
-    label.set_selectable(true);
+    label.set_selectable(false);
+    label.set_cursor_from_name(Some("default"));
     label.add_css_class(css_class);
     label
+}
+
+fn force_default_cursor(widget: &gtk::Widget) {
+    widget.set_cursor_from_name(Some("default"));
+    let mut child = widget.first_child();
+    while let Some(current) = child {
+        child = current.next_sibling();
+        force_default_cursor(&current);
+    }
 }
 
 fn create_conversation_turn(turn: &ConversationTurn) -> ConversationTurnWidgets {
@@ -624,7 +906,12 @@ fn create_conversation_turn(turn: &ConversationTurn) -> ConversationTurnWidgets 
     question_section.set_margin_bottom(12);
     question_section.set_margin_start(16);
     question_section.set_margin_end(16);
-    question_section.append(&section_title("QUESTION", true));
+    let (question_title, answer_title) = if turn.speaker == crate::events::Speaker::Candidate {
+        ("YOU", "COACH")
+    } else {
+        ("QUESTION", "ANSWER")
+    };
+    question_section.append(&section_title(question_title, true));
 
     let question = content_label(&turn.question, "question");
     question_section.append(&question);
@@ -634,7 +921,7 @@ fn create_conversation_turn(turn: &ConversationTurn) -> ConversationTurnWidgets 
     answer_section.set_margin_bottom(16);
     answer_section.set_margin_start(16);
     answer_section.set_margin_end(16);
-    answer_section.append(&section_title("ANSWER", false));
+    answer_section.append(&section_title(answer_title, false));
 
     let answer = content_label("", "answer");
     update_answer(&answer, turn);
@@ -773,8 +1060,25 @@ fn refresh_widgets(state: &OverlayState, widgets: &OverlayWidgets) {
     }
     widgets.status_dot.add_css_class(status_css_class(state));
 
+    let live_coding = state.snapshot.mode == Mode::LiveCoding;
+    widgets
+        .mode_stack
+        .set_visible_child_name(if live_coding {
+            "live-coding"
+        } else {
+            "interview"
+        });
+    widgets.interview_tab.remove_css_class("active");
+    widgets.coding_tab.remove_css_class("active");
+    if live_coding {
+        widgets.coding_tab.add_css_class("active");
+    } else {
+        widgets.interview_tab.add_css_class("active");
+    }
+
     refresh_conversation_history(&state.snapshot.conversation, &widgets.history);
     refresh_transcript_draft(&state.snapshot.transcript_draft, &widgets.history);
+    refresh_live_coding(state, &widgets.live_coding);
 
     widgets.footer.set_text(&status_detail(state));
     let has_queue = state.snapshot.audio_queue_len > 0 || state.snapshot.llm_queue_len > 0;
@@ -784,6 +1088,74 @@ fn refresh_widgets(state: &OverlayState, widgets: &OverlayWidgets) {
             "audio {}  |  answers {}",
             state.snapshot.audio_queue_len, state.snapshot.llm_queue_len
         ));
+    }
+}
+
+fn refresh_live_coding(state: &OverlayState, widgets: &LiveCodingWidgets) {
+    widgets
+        .revision
+        .set_text(&format!("STATE r{}", state.live_coding.revision));
+    widgets.explanation.set_text(
+        (!state.live_coding.explanation.is_empty())
+            .then_some(state.live_coding.explanation.as_str())
+            .unwrap_or("A short explanation will appear with the solution"),
+    );
+    widgets.summary.set_text(
+        (!state.live_coding.summary.is_empty())
+            .then_some(state.live_coding.summary.as_str())
+            .unwrap_or("Summary will appear after the first task segment"),
+    );
+    widgets.language.set_text(
+        (!state.live_coding.language.is_empty())
+            .then_some(state.live_coding.language.as_str())
+            .unwrap_or("JAVA"),
+    );
+    widgets.change_note.set_text(
+        (!state.live_coding.change_note.is_empty())
+            .then_some(state.live_coding.change_note.as_str())
+            .unwrap_or("No generated code yet"),
+    );
+
+    let buffer = widgets.code.buffer();
+    let (start, end) = buffer.bounds();
+    let current_code = buffer.text(&start, &end, true);
+    if current_code.as_str() == state.live_coding.code {
+        return;
+    }
+    apply_code_edits(&buffer, &state.live_coding.code_edits);
+    let (start, end) = buffer.bounds();
+    if buffer.text(&start, &end, true).as_str() != state.live_coding.code {
+        buffer.set_text(&state.live_coding.code);
+    }
+    let (start, end) = buffer.bounds();
+    buffer.remove_all_tags(&start, &end);
+    for line in &state.live_coding.changed_lines {
+        let Ok(line_index) = i32::try_from(line.saturating_sub(1)) else {
+            continue;
+        };
+        let Some(start) = buffer.iter_at_line(line_index) else {
+            continue;
+        };
+        let mut end = start;
+        if !end.forward_line() {
+            end = buffer.end_iter();
+        }
+        buffer.apply_tag_by_name("changed-line", &start, &end);
+    }
+}
+
+fn apply_code_edits(buffer: &TextBuffer, edits: &[crate::events::CodeEdit]) {
+    for edit in edits.iter().rev() {
+        let (Ok(start_offset), Ok(end_offset)) = (
+            i32::try_from(edit.start_offset),
+            i32::try_from(edit.end_offset),
+        ) else {
+            return;
+        };
+        let mut start = buffer.iter_at_offset(start_offset);
+        let mut end = buffer.iter_at_offset(end_offset);
+        buffer.delete(&mut start, &mut end);
+        buffer.insert(&mut start, &edit.replacement);
     }
 }
 
@@ -815,9 +1187,17 @@ fn status_detail(state: &OverlayState) -> String {
         return String::from("Audio transcription paused");
     }
     match state.snapshot.llm_status {
+        WorkerStatus::Working if state.snapshot.mode == Mode::LiveCoding => {
+            String::from("Updating canonical state and code")
+        }
         WorkerStatus::Working => String::from("Generating answer"),
         WorkerStatus::Error => String::from("Answer provider error"),
-        WorkerStatus::Idle if state.snapshot.listening => String::from("System audio"),
+        WorkerStatus::Idle if state.snapshot.mode == Mode::LiveCoding => {
+            String::from("Live coding · interviewer + candidate mic · RAG off")
+        }
+        WorkerStatus::Idle if state.snapshot.listening => {
+            String::from("Interviewer + candidate mic")
+        }
         WorkerStatus::Idle => String::from("Connecting to speech recognition"),
     }
 }
@@ -894,6 +1274,34 @@ fn install_css() {
             background: #25292e;
         }
 
+        .mode-tabs {
+            background: transparent;
+        }
+
+        .mode-tab {
+            min-height: 28px;
+            padding: 2px 12px;
+            color: #777f89;
+            background: transparent;
+            border: 1px solid #2b3036;
+            border-radius: 4px;
+            box-shadow: none;
+            font-family: "JetBrains Mono", monospace;
+            font-size: 10px;
+            font-weight: 600;
+        }
+
+        .mode-tab:hover {
+            color: #edf0f2;
+            border-color: #4b525c;
+        }
+
+        .mode-tab.active {
+            color: #52bacf;
+            background: #162327;
+            border-color: #316773;
+        }
+
         separator {
             min-height: 1px;
             background: #383d45;
@@ -929,6 +1337,81 @@ fn install_css() {
 
         .answer-error {
             color: #ef595c;
+        }
+
+        .coding-page {
+            background: rgba(9, 11, 13, 0.42);
+        }
+
+        .coding-workspace {
+            border-top: 1px solid #252a30;
+        }
+
+        .coding-context {
+            padding-top: 14px;
+        }
+
+        .coding-editor {
+            padding-top: 14px;
+        }
+
+        .coding-state-block {
+            padding: 9px 11px;
+            background: rgba(25, 28, 32, 0.88);
+            border-left: 2px solid #316773;
+            border-radius: 3px;
+        }
+
+        .coding-talk-block {
+            border-left-color: #c9974d;
+            background: rgba(35, 31, 25, 0.90);
+        }
+
+        .coding-revision,
+        .coding-language,
+        .coding-change-note {
+            font-family: "JetBrains Mono", monospace;
+            font-size: 10px;
+        }
+
+        .coding-revision {
+            color: #52bacf;
+            font-weight: 600;
+        }
+
+        .coding-language,
+        .coding-change-note {
+            color: #777f89;
+        }
+
+        .coding-explanation,
+        .coding-summary {
+            color: #d9dde1;
+            font-family: "Noto Sans", sans-serif;
+            font-size: 13px;
+        }
+
+        .coding-explanation {
+            color: #f0dfc2;
+            font-size: 14px;
+        }
+
+        .coding-text-scroll {
+            background: transparent;
+        }
+
+        .coding-code-scroll {
+            margin: 0 16px 14px 14px;
+            border: 1px solid #2b3036;
+            border-radius: 4px;
+        }
+
+        .coding-code,
+        .coding-code text {
+            color: #d9e1e5;
+            background: #0b0d0f;
+            font-family: "JetBrains Mono", monospace;
+            font-size: 12px;
         }
 
         .empty-history {
@@ -978,6 +1461,8 @@ mod tests {
         }));
         state.apply_output(&OutputEvent::Transcript(crate::events::TranscriptView {
             sequence: 1,
+            mode: Mode::Voice,
+            speaker: crate::events::Speaker::Interviewer,
             text: String::from("What is ownership?"),
             flush_reason: String::from("test"),
         }));
@@ -1005,9 +1490,11 @@ mod tests {
     fn applies_live_transcript_draft_to_overlay_state() {
         let mut state = state();
         state.apply_output(&OutputEvent::TranscriptDraft {
+            speaker: crate::events::Speaker::Interviewer,
             text: "Как работает".to_owned(),
         });
         state.apply_output(&OutputEvent::TranscriptDraft {
+            speaker: crate::events::Speaker::Interviewer,
             text: "Как работает HashMap?".to_owned(),
         });
 
