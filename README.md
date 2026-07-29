@@ -64,7 +64,7 @@ Put private Markdown files under the ignored `knowledge/` directory and build th
 cargo run -- rag index knowledge/
 ```
 
-The parser keeps heading hierarchy and text while excluding Markdown images and embedded base64 data. It splits large sections into bounded chunks and embeds them through OpenRouter with `nvidia/nemotron-3-embed-1b:free` at 2048 dimensions by default. The existing `OPENROUTER_API_KEY` and `OPENROUTER_BASE_URL` are reused; no second credential is required. The generated index is stored outside the repository under `${XDG_CACHE_HOME:-~/.cache}/mague-rc/`; neither source documents nor vectors are added to Git.
+The parser keeps heading hierarchy and text while excluding Markdown images and embedded base64 data. It splits large sections into bounded chunks and embeds them through OpenRouter with `perplexity/pplx-embed-v1-4b` at 2560 dimensions by default. The existing `OPENROUTER_API_KEY` and `OPENROUTER_BASE_URL` are reused; no second credential is required. The generated index is stored outside the repository under `${XDG_CACHE_HOME:-~/.cache}/mague-rc/`; neither source documents nor vectors are added to Git.
 
 Indexing requires OpenRouter once for every changed chunk. Live queries use the same embeddings endpoint while vector similarity and lexical ranking remain local. Neither command requires Deepgram, Groq, Python, a separate server, or a local ML runtime. Test retrieval directly with:
 
@@ -107,6 +107,18 @@ Each run writes two ignored artifacts under `telemetry/`:
 
 - `*.events.jsonl` is the chronological event stream with monotonic timestamps and raw STT/LLM events.
 - `*.summary.json` contains run metadata, audio/reference hashes, effective non-secret configuration, Git branch/commit/dirty state, recognized utterances, submitted questions, complete answers, token usage, cost, and aggregate latency distributions.
+
+To compare text models without repeating STT and segmentation, run the LLM-only benchmark. It retrieves and freezes one knowledge context per reference question, then sends identical prompts without conversation history to every model:
+
+```bash
+cargo run --example llm_benchmark -- \
+  --model openai/gpt-4o-mini \
+  --model google/gemini-3.5-flash-lite \
+  --repeat 3 \
+  --output telemetry/llm-model-ab.json
+```
+
+Without explicit `--model` or `--questions` arguments, the example uses its built-in candidate list and all six `benchmark_*.expected.txt` files. The resulting ignored JSON contains every answer, retrieval hit, TTFT, total latency, token usage, provider-reported cost, failures, and aggregate p50/p95 metrics.
 
 The request summary separates question construction, RAG searches and final wait, queue wait, LLM time to first token, generation time, speech-boundary-to-first-token latency, and estimated full last-word-to-first-token latency. Each attached RAG context records chunk headings, scores, character count, accumulated embedding/search time, and boundary wait. The full latency estimate adds Deepgram's final-word-to-boundary interval to the locally measured boundary-to-token duration, so audio-clock drift cannot produce a value shorter than the boundary latency. It includes endpointing, non-negative STT delivery lag, queueing, and LLM TTFT. The STT summary reports approximate delivery lag for interim/final transcripts, speech-start events, and utterance-end events from Deepgram's audio positions; the raw receive and audio timestamps remain in JSONL for inspection. These provider timestamps are useful for comparisons but are not guaranteed to be millisecond-precise. With a reference file the summary also reports normalized word error rate (`WER`) and character error rate (`CER`) globally and per line.
 

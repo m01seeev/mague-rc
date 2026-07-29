@@ -193,7 +193,7 @@ impl Config {
             llm: LlmConfig {
                 api_key: SecretString::new(reader.required("OPENROUTER_API_KEY")?),
                 base_url: reader.url("OPENROUTER_BASE_URL", DEFAULT_OPENROUTER_BASE_URL)?,
-                model: reader.string("MODEL_TEXT", "openai/gpt-4o-mini"),
+                model: reader.string("MODEL_TEXT", "google/gemini-3.5-flash-lite"),
                 queue_max: reader.parse("LLM_QUEUE_MAX", 0)?,
                 max_history_pairs: reader.parse("MAX_HISTORY_PAIRS", 4)?,
                 separate_histories: reader.boolean("SEPARATE_HISTORIES", true)?,
@@ -347,7 +347,7 @@ fn load_dotenv() -> Result<(), ConfigError> {
 }
 
 fn embedding_config(reader: &ConfigReader<'_>) -> Result<EmbeddingConfig, ConfigError> {
-    let model = reader.string("RAG_EMBEDDING_MODEL", "nvidia/nemotron-3-embed-1b:free");
+    let model = reader.string("RAG_EMBEDDING_MODEL", "perplexity/pplx-embed-v1-4b");
     let (default_query_type, default_document_type) = if model.contains("nemotron") {
         ("query", "passage")
     } else {
@@ -357,7 +357,7 @@ fn embedding_config(reader: &ConfigReader<'_>) -> Result<EmbeddingConfig, Config
         api_key: SecretString::new(reader.required("OPENROUTER_API_KEY")?),
         base_url: reader.url("OPENROUTER_BASE_URL", DEFAULT_OPENROUTER_BASE_URL)?,
         model,
-        dimensions: reader.parse("RAG_EMBEDDING_DIMENSIONS", 2_048)?,
+        dimensions: reader.parse("RAG_EMBEDDING_DIMENSIONS", 2_560)?,
         query_input_type: reader.string("RAG_EMBEDDING_QUERY_INPUT_TYPE", default_query_type),
         document_input_type: reader
             .string("RAG_EMBEDDING_DOCUMENT_INPUT_TYPE", default_document_type),
@@ -590,15 +590,19 @@ mod tests {
         assert_eq!(config.deepgram.channels, 1);
         assert_eq!(config.audio.chunk_ms, 100);
         assert_eq!(config.transcript.window_sec, 5);
+        assert_eq!(config.llm.model, "google/gemini-3.5-flash-lite");
         assert_eq!(config.llm.max_history_pairs, 4);
         assert_eq!(config.knowledge.top_k, 3);
         assert_eq!(
             config.knowledge.embedding.model,
-            "nvidia/nemotron-3-embed-1b:free"
+            "perplexity/pplx-embed-v1-4b"
         );
-        assert_eq!(config.knowledge.embedding.dimensions, 2_048);
-        assert_eq!(config.knowledge.embedding.query_input_type, "query");
-        assert_eq!(config.knowledge.embedding.document_input_type, "passage");
+        assert_eq!(config.knowledge.embedding.dimensions, 2_560);
+        assert_eq!(config.knowledge.embedding.query_input_type, "search_query");
+        assert_eq!(
+            config.knowledge.embedding.document_input_type,
+            "search_document"
+        );
         assert!(config.screenshot.enabled);
     }
 
