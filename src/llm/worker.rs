@@ -508,8 +508,14 @@ mod tests {
         assert_eq!(requests[0].messages.len(), 3);
         assert_eq!(requests[0].messages[1].role, ChatRole::System);
         assert!(requests[0].messages[1].content.contains("Java > HashMap"));
-        assert_eq!(requests[0].messages[2].content, "question 1");
+        assert_eq!(
+            requests[0].messages[2].content,
+            voice_user_prompt(Speaker::Interviewer, "question 1")
+        );
         assert_eq!(requests[1].messages.len(), 4);
-        assert_eq!(requests[1].messages[1].content, "question 1");
+        assert_eq!(
+            requests[1].messages[1].content,
+            voice_user_prompt(Speaker::Interviewer, "question 1")
+        );
     }
 }

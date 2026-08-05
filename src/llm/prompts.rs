@@ -48,7 +48,7 @@ mod tests {
         let prompt = voice_system_prompt("АО Консалт Плюс");
 
         assert!(prompt.contains("Текущий проект кандидата: АО Консалт Плюс"));
-        assert!(prompt.contains("завершённый вопрос"));
+        assert!(prompt.contains("завершённая реплика"));
         assert!(prompt.contains("актуальное поведение современных стабильных версий"));
         assert!(prompt.contains("Не выдумывай опыт"));
         assert!(prompt.contains("не упоминай текущий проект"));
